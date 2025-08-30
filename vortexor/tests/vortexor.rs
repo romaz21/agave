@@ -1,20 +1,20 @@
 use {
     crossbeam_channel::unbounded,
     log::info,
+    solana_keypair::Keypair,
     solana_local_cluster::{
         cluster::ClusterValidatorInfo,
         local_cluster::{ClusterConfig, LocalCluster},
     },
+    solana_native_token::LAMPORTS_PER_SOL,
     solana_net_utils::VALIDATOR_PORT_RANGE,
-    solana_sdk::{
-        native_token::LAMPORTS_PER_SOL, net::DEFAULT_TPU_COALESCE, pubkey::Pubkey,
-        signature::Keypair, signer::Signer,
-    },
+    solana_pubkey::Pubkey,
+    solana_signer::Signer,
     solana_streamer::{
         nonblocking::testing_utilities::check_multiple_streams,
         quic::{
             DEFAULT_MAX_CONNECTIONS_PER_IPADDR_PER_MINUTE, DEFAULT_MAX_STAKED_CONNECTIONS,
-            DEFAULT_MAX_STREAMS_PER_MS, DEFAULT_MAX_UNSTAKED_CONNECTIONS,
+            DEFAULT_MAX_STREAMS_PER_MS, DEFAULT_MAX_UNSTAKED_CONNECTIONS, DEFAULT_TPU_COALESCE,
         },
         socket::SocketAddrSpace,
         streamer::StakedNodes,
@@ -90,8 +90,8 @@ async fn test_vortexor() {
 fn get_server_urls(validator: &ClusterValidatorInfo) -> (Url, Url) {
     let rpc_addr = validator.info.contact_info.rpc().unwrap();
     let rpc_pubsub_addr = validator.info.contact_info.rpc_pubsub().unwrap();
-    let rpc_url = Url::parse(format!("http://{}", rpc_addr).as_str()).unwrap();
-    let ws_url = Url::parse(format!("ws://{}", rpc_pubsub_addr).as_str()).unwrap();
+    let rpc_url = Url::parse(format!("http://{rpc_addr}").as_str()).unwrap();
+    let ws_url = Url::parse(format!("ws://{rpc_pubsub_addr}").as_str()).unwrap();
     (rpc_url, ws_url)
 }
 
@@ -135,7 +135,7 @@ fn test_stake_update() {
             .recv_timeout(slot_receive_timeout)
             .unwrap_or_else(|_| panic!("Expected a slot within {slot_receive_timeout:?}"));
         i += 1;
-        info!("Received a slot update: {}", slot);
+        info!("Received a slot update: {slot}");
     }
 
     let rpc_load_balancer = Arc::new(rpc_load_balancer);
@@ -154,10 +154,10 @@ fn test_stake_update() {
     loop {
         let stakes = shared_staked_nodes.read().unwrap();
         if let Some(stake) = stakes.get_node_stake(pubkey) {
-            info!("Stake for {}: {}", pubkey, stake);
+            info!("Stake for {pubkey}: {stake}");
             assert_eq!(stake, default_node_stake);
             let total_stake = stakes.total_stake();
-            info!("total_stake: {}", total_stake);
+            info!("total_stake: {total_stake}");
             assert!(total_stake >= default_node_stake);
             break;
         }

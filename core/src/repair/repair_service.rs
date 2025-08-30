@@ -1,11 +1,7 @@
 //! The `repair_service` module implements the tools necessary to generate a thread which
 //! regularly finds missing shreds in the ledger and sends repair requests for those shreds
-#[cfg(test)]
 use {
-    crate::repair::duplicate_repair_status::DuplicateSlotRepairStatus,
-    solana_clock::DEFAULT_MS_PER_SLOT, solana_keypair::Keypair,
-};
-use {
+    super::standard_repair_handler::StandardRepairHandler,
     crate::{
         cluster_info_vote_listener::VerifiedVoteReceiver,
         cluster_slots_service::cluster_slots::ClusterSlots,
@@ -37,7 +33,10 @@ use {
     },
     solana_measure::measure::Measure,
     solana_pubkey::Pubkey,
-    solana_runtime::{bank::Bank, bank_forks::BankForks, root_bank_cache::RootBankCache},
+    solana_runtime::{
+        bank::Bank,
+        bank_forks::{BankForks, SharableBanks},
+    },
     solana_streamer::sendmmsg::{batch_send, SendPktsError},
     solana_time_utils::timestamp,
     std::{
@@ -52,6 +51,11 @@ use {
         time::{Duration, Instant},
     },
     tokio::sync::mpsc::Sender as AsyncSender,
+};
+#[cfg(test)]
+use {
+    crate::repair::duplicate_repair_status::DuplicateSlotRepairStatus,
+    solana_clock::DEFAULT_MS_PER_SLOT, solana_keypair::Keypair,
 };
 
 // Time to defer repair requests to allow for turbine propagation
@@ -171,7 +175,7 @@ impl RepairStats {
             .chain(self.orphan.slot_pubkeys.iter())
             .map(|(slot, slot_repairs)| (slot, slot_repairs.pubkey_repairs.values().sum::<u64>()))
             .collect();
-        info!("repair_stats: {:?}", slot_to_count);
+        info!("repair_stats: {slot_to_count:?}");
         if repair_total > 0 {
             let nonzero_num = |x| if x == 0 { None } else { Some(x) };
             datapoint_info!(
@@ -416,7 +420,7 @@ impl RepairServiceChannels {
 }
 
 struct RepairTracker {
-    root_bank_cache: RootBankCache,
+    sharable_banks: SharableBanks,
     repair_weight: RepairWeight,
     serve_repair: ServeRepair,
     repair_metrics: RepairMetrics,
@@ -449,7 +453,7 @@ impl RepairService {
                 .name("solRepairSvc".to_string())
                 .spawn(move || {
                     Self::run(
-                        &blockstore,
+                        blockstore,
                         &exit,
                         &repair_socket,
                         repair_service_channels.repair_channels,
@@ -608,10 +612,7 @@ impl RepairService {
             }
         });
         if !popular_pruned_forks.is_empty() {
-            warn!(
-                "Notifying repair of popular pruned forks {:?}",
-                popular_pruned_forks
-            );
+            warn!("Notifying repair of popular pruned forks {popular_pruned_forks:?}");
             popular_pruned_forks_sender
                 .send(popular_pruned_forks)
                 .unwrap_or_else(|err| error!("failed to send popular pruned forks {err}"));
@@ -664,7 +665,9 @@ impl RepairService {
                 Ok(()) => (),
                 Err(SendPktsError::IoError(err, num_failed)) => {
                     error!(
-                        "{} batch_send failed to send {num_failed}/{num_pkts} packets first error {err:?}", repair_info.cluster_info.id()
+                        "{} batch_send failed to send {num_failed}/{num_pkts} packets first error \
+                         {err:?}",
+                        repair_info.cluster_info.id()
                     );
                 }
             }
@@ -690,7 +693,7 @@ impl RepairService {
             popular_pruned_forks_sender,
         } = repair_channels;
         let RepairTracker {
-            root_bank_cache,
+            sharable_banks,
             repair_weight,
             serve_repair,
             repair_metrics,
@@ -698,7 +701,7 @@ impl RepairService {
             popular_pruned_forks_requests,
             outstanding_repairs,
         } = repair_tracker;
-        let root_bank = root_bank_cache.root_bank();
+        let root_bank = sharable_banks.root();
 
         Self::update_weighting_heuristic(
             blockstore,
@@ -741,23 +744,26 @@ impl RepairService {
     }
 
     fn run(
-        blockstore: &Blockstore,
+        blockstore: Arc<Blockstore>,
         exit: &AtomicBool,
         repair_socket: &UdpSocket,
         repair_channels: RepairChannels,
         repair_info: RepairInfo,
         outstanding_requests: &RwLock<OutstandingShredRepairs>,
     ) {
-        let mut root_bank_cache = RootBankCache::new(repair_info.bank_forks.clone());
-        let root_bank_slot = root_bank_cache.root_bank().slot();
+        let sharable_banks = repair_info.bank_forks.read().unwrap().sharable_banks();
+        let root_bank_slot = sharable_banks.root().slot();
         let mut repair_tracker = RepairTracker {
-            root_bank_cache,
+            sharable_banks,
             repair_weight: RepairWeight::new(root_bank_slot),
-            serve_repair: ServeRepair::new(
-                repair_info.cluster_info.clone(),
-                repair_info.bank_forks.clone(),
-                repair_info.repair_whitelist.clone(),
-            ),
+            serve_repair: {
+                ServeRepair::new(
+                    repair_info.cluster_info.clone(),
+                    repair_info.bank_forks.read().unwrap().sharable_banks(),
+                    repair_info.repair_whitelist.clone(),
+                    Box::new(StandardRepairHandler::new(blockstore.clone())),
+                )
+            },
             repair_metrics: RepairMetrics::default(),
             peers_cache: LruCache::new(REPAIR_PEERS_CACHE_CAPACITY),
             popular_pruned_forks_requests: HashSet::new(),
@@ -766,7 +772,7 @@ impl RepairService {
 
         while !exit.load(Ordering::Relaxed) {
             Self::run_repair_iteration(
-                blockstore,
+                blockstore.as_ref(),
                 &repair_channels,
                 &repair_info,
                 &mut repair_tracker,
@@ -948,11 +954,8 @@ impl RepairService {
 
         // Filter out any peers that don't have a valid repair socket.
         let repair_peers: Vec<(Pubkey, SocketAddr, u32)> = peers_with_slot
-            .read()
-            .unwrap()
             .iter()
             .filter_map(|(pubkey, stake)| {
-                let stake = stake.load(Ordering::Relaxed);
                 let peer_repair_addr = cluster_info
                     .lookup_contact_info(pubkey, |node| node.serve_repair(Protocol::UDP));
                 if let Some(Some(peer_repair_addr)) = peer_repair_addr {
@@ -1066,7 +1069,7 @@ impl RepairService {
                 debug!("successfully sent repair request to {pubkey} / {address}!");
             }
             Err(SendPktsError::IoError(err, _num_failed)) => {
-                error!("batch_send failed to send packet - error = {:?}", err);
+                error!("batch_send failed to send packet - error = {err:?}");
             }
         }
     }
@@ -1182,8 +1185,8 @@ impl RepairService {
                             Ok(req) => {
                                 if let Err(e) = repair_socket.send_to(&req, repair_addr) {
                                     info!(
-                                        "repair req send_to {} ({}) error {:?}",
-                                        repair_pubkey, repair_addr, e
+                                        "repair req send_to {repair_pubkey} ({repair_addr}) error \
+                                         {e:?}"
                                     );
                                 }
                             }
@@ -1265,7 +1268,7 @@ mod test {
     use {
         super::*,
         crate::repair::quic_endpoint::RemoteRequest,
-        solana_gossip::{cluster_info::Node, contact_info::ContactInfo},
+        solana_gossip::{contact_info::ContactInfo, node::Node},
         solana_keypair::Keypair,
         solana_ledger::{
             blockstore::{
@@ -1275,7 +1278,7 @@ mod test {
             get_tmp_ledger_path_auto_delete,
             shred::max_ticks_per_n_shreds,
         },
-        solana_net_utils::{bind_to_localhost, bind_to_unspecified},
+        solana_net_utils::sockets::bind_to_localhost_unique,
         solana_runtime::bank::Bank,
         solana_signer::Signer,
         solana_streamer::socket::SocketAddrSpace,
@@ -1296,9 +1299,9 @@ mod test {
         let pubkey = cluster_info.id();
         let slot = 100;
         let shred_index = 50;
-        let reader = bind_to_localhost().expect("bind");
+        let reader = bind_to_localhost_unique().expect("should bind");
         let address = reader.local_addr().unwrap();
-        let sender = bind_to_localhost().expect("bind");
+        let sender = bind_to_localhost_unique().expect("should bind");
         let outstanding_repair_requests = Arc::new(RwLock::new(OutstandingShredRepairs::default()));
 
         // Send a repair request
@@ -1347,8 +1350,8 @@ mod test {
         let blockstore = Blockstore::open(ledger_path.path()).unwrap();
 
         // Create some orphan slots
-        let (mut shreds, _) = make_slot_entries(1, 0, 1, /*merkle_variant:*/ true);
-        let (shreds2, _) = make_slot_entries(5, 2, 1, /*merkle_variant:*/ true);
+        let (mut shreds, _) = make_slot_entries(1, 0, 1);
+        let (shreds2, _) = make_slot_entries(5, 2, 1);
         shreds.extend(shreds2);
         blockstore.insert_shreds(shreds, None, false).unwrap();
         let mut repair_weight = RepairWeight::new(0);
@@ -1376,7 +1379,7 @@ mod test {
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Blockstore::open(ledger_path.path()).unwrap();
 
-        let (shreds, _) = make_slot_entries(2, 0, 1, /*merkle_variant:*/ true);
+        let (shreds, _) = make_slot_entries(2, 0, 1);
 
         // Write this shred to slot 2, should chain to slot 0, which we haven't received
         // any shreds for
@@ -1484,7 +1487,6 @@ mod test {
             0, // slot
             0, // parent_slot
             num_entries_per_slot as u64,
-            true, // merkle_variant
         );
         let num_shreds_per_slot = shreds.len() as u64;
 
@@ -1578,7 +1580,6 @@ mod test {
                 i, // slot
                 parent,
                 num_entries_per_slot as u64,
-                true, // merkle_variant
             );
 
             blockstore.insert_shreds(shreds, None, false).unwrap();
@@ -1616,7 +1617,6 @@ mod test {
             dead_slot,     // slot
             dead_slot - 1, // parent_slot
             num_entries_per_slot,
-            true, // merkle_variant
         );
         blockstore
             .insert_shreds(shreds[..shreds.len() - 1].to_vec(), None, false)
@@ -1640,18 +1640,21 @@ mod test {
         let bank = Bank::new_for_tests(&genesis_config);
         let bank_forks = BankForks::new_rw_arc(bank);
         let ledger_path = get_tmp_ledger_path_auto_delete!();
-        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
         let cluster_slots = ClusterSlots::default();
         let cluster_info = Arc::new(new_test_cluster_info());
         let identity_keypair = cluster_info.keypair().clone();
-        let serve_repair = ServeRepair::new(
-            cluster_info,
-            bank_forks,
-            Arc::new(RwLock::new(HashSet::default())),
-        );
+        let serve_repair = {
+            ServeRepair::new(
+                cluster_info,
+                bank_forks.read().unwrap().sharable_banks(),
+                Arc::new(RwLock::new(HashSet::default())),
+                Box::new(StandardRepairHandler::new(blockstore.clone())),
+            )
+        };
         let mut duplicate_slot_repair_statuses = HashMap::new();
         let dead_slot = 9;
-        let receive_socket = &bind_to_unspecified().unwrap();
+        let receive_socket = &bind_to_localhost_unique().expect("should bind - receive socket");
         let duplicate_status = DuplicateSlotRepairStatus {
             correct_ancestor_to_repair: (dead_slot, Hash::default()),
             start_ts: u64::MAX,
@@ -1660,12 +1663,7 @@ mod test {
 
         // Insert some shreds to create a SlotMeta,
         let num_entries_per_slot = max_ticks_per_n_shreds(1, None) + 1;
-        let (mut shreds, _) = make_slot_entries(
-            dead_slot,
-            dead_slot - 1,
-            num_entries_per_slot,
-            true, // merkle_variant
-        );
+        let (mut shreds, _) = make_slot_entries(dead_slot, dead_slot - 1, num_entries_per_slot);
         blockstore
             .insert_shreds(shreds[..shreds.len() - 1].to_vec(), None, false)
             .unwrap();
@@ -1680,7 +1678,7 @@ mod test {
             &blockstore,
             &serve_repair,
             &mut RepairStats::default(),
-            &bind_to_unspecified().unwrap(),
+            &bind_to_localhost_unique().expect("should bind - repair socket"),
             &None,
             &RwLock::new(OutstandingRequests::default()),
             &identity_keypair,
@@ -1706,7 +1704,7 @@ mod test {
             &blockstore,
             &serve_repair,
             &mut RepairStats::default(),
-            &bind_to_unspecified().unwrap(),
+            &bind_to_localhost_unique().expect("should bind - repair socket"),
             &None,
             &RwLock::new(OutstandingRequests::default()),
             &identity_keypair,
@@ -1725,7 +1723,7 @@ mod test {
             &blockstore,
             &serve_repair,
             &mut RepairStats::default(),
-            &bind_to_unspecified().unwrap(),
+            &bind_to_localhost_unique().expect("should bind - repair socket"),
             &None,
             &RwLock::new(OutstandingRequests::default()),
             &identity_keypair,
@@ -1740,21 +1738,30 @@ mod test {
         let bank_forks = BankForks::new_rw_arc(bank);
         let dummy_addr = Some((
             Pubkey::default(),
-            bind_to_unspecified().unwrap().local_addr().unwrap(),
+            bind_to_localhost_unique()
+                .expect("should bind - dummy socket")
+                .local_addr()
+                .unwrap(),
         ));
         let cluster_info = Arc::new(new_test_cluster_info());
-        let serve_repair = ServeRepair::new(
-            cluster_info.clone(),
-            bank_forks,
-            Arc::new(RwLock::new(HashSet::default())),
-        );
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
+        let serve_repair = {
+            ServeRepair::new(
+                cluster_info.clone(),
+                bank_forks.read().unwrap().sharable_banks(),
+                Arc::new(RwLock::new(HashSet::default())),
+                Box::new(StandardRepairHandler::new(blockstore)),
+            )
+        };
         let valid_repair_peer = Node::new_localhost().info;
 
         // Signal that this peer has confirmed the dead slot, and is thus
         // a valid target for repair
         let dead_slot = 9;
         let cluster_slots = ClusterSlots::default();
-        cluster_slots.insert_node_id(dead_slot, *valid_repair_peer.pubkey(), Some(42));
+        cluster_slots.fake_epoch_info_for_tests(HashMap::from([(*valid_repair_peer.pubkey(), 42)]));
+        cluster_slots.insert_node_id(dead_slot, *valid_repair_peer.pubkey());
         cluster_info.insert_info(valid_repair_peer);
 
         // Not enough time has passed, should not update the

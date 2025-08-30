@@ -5,7 +5,7 @@ use {
     crate::rpc_load_balancer::RpcLoadBalancer,
     log::{info, warn},
     solana_client::client_error,
-    solana_sdk::pubkey::Pubkey,
+    solana_pubkey::Pubkey,
     solana_streamer::streamer::StakedNodes,
     std::{
         collections::HashMap,
@@ -52,7 +52,7 @@ impl StakeUpdater {
                         &rpc_load_balancer,
                         &refresh_sleep_duration,
                     ) {
-                        warn!("Failed to refresh pubkey to stake map! Error: {:?}", err);
+                        warn!("Failed to refresh pubkey to stake map! Error: {err:?}");
                         sleep(refresh_sleep_duration);
                     }
                 }

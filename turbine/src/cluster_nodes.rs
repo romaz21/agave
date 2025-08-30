@@ -5,6 +5,8 @@ use {
     lazy_lru::LruCache,
     rand::{seq::SliceRandom, Rng, SeedableRng},
     rand_chacha::ChaChaRng,
+    solana_clock::{Epoch, Slot},
+    solana_cluster_type::ClusterType,
     solana_gossip::{
         cluster_info::ClusterInfo,
         contact_info::{ContactInfo as GossipContactInfo, Protocol},
@@ -14,17 +16,14 @@ use {
         crds_value::CrdsValue,
         weighted_shuffle::WeightedShuffle,
     },
+    solana_keypair::Keypair,
     solana_ledger::shred::ShredId,
+    solana_native_token::LAMPORTS_PER_SOL,
+    solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
-    solana_sdk::{
-        clock::{Epoch, Slot},
-        genesis_config::ClusterType,
-        native_token::LAMPORTS_PER_SOL,
-        pubkey::Pubkey,
-        signature::{Keypair, Signer},
-        timing::timestamp,
-    },
+    solana_signer::Signer,
     solana_streamer::socket::SocketAddrSpace,
+    solana_time_utils::timestamp,
     std::{
         any::TypeId,
         cell::RefCell,
@@ -47,9 +46,6 @@ thread_local! {
 
 const DATA_PLANE_FANOUT: usize = 200;
 pub(crate) const MAX_NUM_TURBINE_HOPS: usize = 4;
-
-// Limit number of nodes per IP address.
-const MAX_NUM_NODES_PER_IP_ADDRESS: usize = 10;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -399,10 +395,13 @@ fn cmp_nodes_stake(a: &Node, b: &Node) -> Ordering {
         })
 }
 
-// Dedups socket addresses so that if there are 2 nodes in the cluster with the
-// same TVU socket-addr, we only send shreds to one of them.
-// Additionally limits number of nodes at the same IP address to
-// MAX_NUM_NODES_PER_IP_ADDRESS.
+/// If set > 1 it allows the nodes to run behind a NAT.
+/// This usecase is currently not supported.
+const MAX_NUM_NODES_PER_IP_ADDRESS: usize = 1;
+
+/// Dedups socket addresses so that if there are 2 nodes in the cluster with the
+/// same TVU socket-addr, we only send shreds to one of them.
+/// Additionally limits number of nodes at the same IP address to 1
 fn dedup_tvu_addrs(nodes: &mut Vec<Node>) {
     const TVU_PROTOCOLS: [Protocol; 2] = [Protocol::UDP, Protocol::QUIC];
     let capacity = nodes.len().saturating_mul(2);
@@ -562,8 +561,8 @@ impl<T: 'static> ClusterNodesCache<T> {
                 .find_map(|bank| bank.epoch_staked_nodes(epoch))
                 .unwrap_or_else(|| {
                     error!(
-                        "ClusterNodesCache::get: unknown Bank::epoch_staked_nodes \
-                    for epoch: {epoch}, slot: {shred_slot}"
+                        "ClusterNodesCache::get: unknown Bank::epoch_staked_nodes for epoch: \
+                         {epoch}, slot: {shred_slot}"
                     );
                     inc_new_counter_error!("cluster_nodes-unknown_epoch_staked_nodes", 1);
                     Arc::<HashMap<Pubkey, /*stake:*/ u64>>::default()
@@ -631,7 +630,7 @@ pub fn make_test_cluster<R: Rng>(
 ) {
     let (unstaked_numerator, unstaked_denominator) = unstaked_ratio.unwrap_or((1, 7));
     let mut nodes: Vec<_> = repeat_with(|| {
-        let pubkey = solana_sdk::pubkey::new_rand();
+        let pubkey = solana_pubkey::new_rand();
         GossipContactInfo::new_localhost(&pubkey, /*wallclock:*/ timestamp())
     })
     .take(num_nodes)

@@ -11,13 +11,13 @@ use {
         },
         feature::{status_from_account, CliFeatureStatus},
     },
-    agave_feature_set::{FeatureSet, FEATURE_NAMES},
+    agave_feature_set::{raise_cpi_nesting_limit_to_8, FeatureSet, FEATURE_NAMES},
+    agave_syscalls::create_program_runtime_environment_v1,
     bip39::{Language, Mnemonic, MnemonicType, Seed},
     clap::{App, AppSettings, Arg, ArgMatches, SubCommand},
     log::*,
     solana_account::{state_traits::StateMut, Account},
     solana_account_decoder::{UiAccountEncoding, UiDataSliceConfig},
-    solana_bpf_loader_program::syscalls::create_program_runtime_environment_v1,
     solana_clap_utils::{
         self,
         compute_budget::{compute_unit_price_arg, ComputeUnitLimit},
@@ -169,8 +169,9 @@ pub enum ProgramCliCommand {
         use_lamports_unit: bool,
         bypass_warning: bool,
     },
-    ExtendProgram {
+    ExtendProgramChecked {
         program_pubkey: Pubkey,
+        authority_signer_index: SignerIndex,
         additional_bytes: u32,
     },
     MigrateProgram {
@@ -233,9 +234,10 @@ impl ProgramSubCommands for App<'_, '_> {
                             Arg::with_name("program_id")
                                 .long("program-id")
                                 .value_name("PROGRAM_ID"),
-                            "Executable program; must be a signer for initial deploys, \
-                             can be an address for upgrades [default: address of keypair at \
-                             /path/to/program-keypair.json if present, otherwise a random address]."
+                            "Executable program; must be a signer for initial deploys, can be an \
+                             address for upgrades [default: address of keypair at \
+                             /path/to/program-keypair.json if present, otherwise a random \
+                             address]."
                         ))
                         .arg(
                             Arg::with_name("final")
@@ -249,8 +251,8 @@ impl ProgramSubCommands for App<'_, '_> {
                                 .takes_value(true)
                                 .required(false)
                                 .help(
-                                    "Maximum length of the upgradeable program \
-                                    [default: the length of the original deployed program]",
+                                    "Maximum length of the upgradeable program [default: the \
+                                     length of the original deployed program]",
                                 ),
                         )
                         .arg(
@@ -271,20 +273,20 @@ impl ProgramSubCommands for App<'_, '_> {
                                 .default_value("5")
                                 .help(
                                     "Maximum number of attempts to sign or resign transactions \
-                                    after blockhash expiration. \
-                                    If any transactions sent during the program deploy are still \
-                                    unconfirmed after the initially chosen recent blockhash \
-                                    expires, those transactions will be resigned with a new \
-                                    recent blockhash and resent. Use this setting to adjust \
-                                    the maximum number of transaction signing iterations. Each \
-                                    blockhash is valid for about 60 seconds, which means using \
-                                    the default value of 5 will lead to sending transactions \
-                                    for at least 5 minutes or until all transactions are confirmed,\
-                                    whichever comes first.",
+                                     after blockhash expiration. If any transactions sent during \
+                                     the program deploy are still unconfirmed after the initially \
+                                     chosen recent blockhash expires, those transactions will be \
+                                     resigned with a new recent blockhash and resent. Use this \
+                                     setting to adjust the maximum number of transaction signing \
+                                     iterations. Each blockhash is valid for about 60 seconds, \
+                                     which means using the default value of 5 will lead to \
+                                     sending transactions for at least 5 minutes or until all \
+                                     transactions are confirmed,whichever comes first.",
                                 ),
                         )
                         .arg(Arg::with_name("use_rpc").long("use-rpc").help(
-                            "Send write transactions to the configured RPC instead of validator TPUs",
+                            "Send write transactions to the configured RPC instead of validator \
+                             TPUs",
                         ))
                         .arg(compute_unit_price_arg())
                         .arg(
@@ -297,9 +299,12 @@ impl ProgramSubCommands for App<'_, '_> {
                             Arg::with_name("skip_feature_verify")
                                 .long("skip-feature-verify")
                                 .takes_value(false)
-                                .help("Don't verify program against the activated feature set. \
-                                This setting means a program containing a syscall not yet active on \
-                                mainnet will succeed local verification, but fail during the last step of deployment.")
+                                .help(
+                                    "Don't verify program against the activated feature set. This \
+                                     setting means a program containing a syscall not yet active \
+                                     on mainnet will succeed local verification, but fail during \
+                                     the last step of deployment.",
+                                ),
                         ),
                 )
                 .subcommand(
@@ -334,9 +339,12 @@ impl ProgramSubCommands for App<'_, '_> {
                             Arg::with_name("skip_feature_verify")
                                 .long("skip-feature-verify")
                                 .takes_value(false)
-                                .help("Don't verify program against the activated feature set. \
-                                This setting means a program containing a syscall not yet active on \
-                                mainnet will succeed local verification, but fail during the last step of deployment.")
+                                .help(
+                                    "Don't verify program against the activated feature set. This \
+                                     setting means a program containing a syscall not yet active \
+                                     on mainnet will succeed local verification, but fail during \
+                                     the last step of deployment.",
+                                ),
                         )
                         .offline_args(),
                 )
@@ -377,8 +385,8 @@ impl ProgramSubCommands for App<'_, '_> {
                                 .takes_value(true)
                                 .required(false)
                                 .help(
-                                    "Maximum length of the upgradeable program \
-                                    [default: the length of the original deployed program]",
+                                    "Maximum length of the upgradeable program [default: the \
+                                     length of the original deployed program]",
                                 ),
                         )
                         .arg(
@@ -389,16 +397,15 @@ impl ProgramSubCommands for App<'_, '_> {
                                 .default_value("5")
                                 .help(
                                     "Maximum number of attempts to sign or resign transactions \
-                                    after blockhash expiration. \
-                                    If any transactions sent during the program deploy are still \
-                                    unconfirmed after the initially chosen recent blockhash \
-                                    expires, those transactions will be resigned with a new \
-                                    recent blockhash and resent. Use this setting to adjust \
-                                    the maximum number of transaction signing iterations. Each \
-                                    blockhash is valid for about 60 seconds, which means using \
-                                    the default value of 5 will lead to sending transactions \
-                                    for at least 5 minutes or until all transactions are confirmed,\
-                                    whichever comes first.",
+                                     after blockhash expiration. If any transactions sent during \
+                                     the program deploy are still unconfirmed after the initially \
+                                     chosen recent blockhash expires, those transactions will be \
+                                     resigned with a new recent blockhash and resent. Use this \
+                                     setting to adjust the maximum number of transaction signing \
+                                     iterations. Each blockhash is valid for about 60 seconds, \
+                                     which means using the default value of 5 will lead to \
+                                     sending transactions for at least 5 minutes or until all \
+                                     transactions are confirmed,whichever comes first.",
                                 ),
                         )
                         .arg(Arg::with_name("use_rpc").long("use-rpc").help(
@@ -409,9 +416,12 @@ impl ProgramSubCommands for App<'_, '_> {
                             Arg::with_name("skip_feature_verify")
                                 .long("skip-feature-verify")
                                 .takes_value(false)
-                                .help("Don't verify program against the activated feature set. \
-                                This setting means a program containing a syscall not yet active on \
-                                mainnet will succeed local verification, but fail during the last step of deployment.")
+                                .help(
+                                    "Don't verify program against the activated feature set. This \
+                                     setting means a program containing a syscall not yet active \
+                                     on mainnet will succeed local verification, but fail during \
+                                     the last step of deployment.",
+                                ),
                         ),
                 )
                 .subcommand(
@@ -597,8 +607,8 @@ impl ProgramSubCommands for App<'_, '_> {
                             Arg::with_name("recipient_account")
                                 .long("recipient")
                                 .value_name("RECIPIENT_ADDRESS"),
-                            "Recipient of closed account's lamports \
-                             [default: the default configured keypair]."
+                            "Recipient of closed account's lamports [default: the default \
+                             configured keypair]."
                         ))
                         .arg(
                             Arg::with_name("lamports")
@@ -642,9 +652,7 @@ impl ProgramSubCommands for App<'_, '_> {
                 )
                 .subcommand(
                     SubCommand::with_name("migrate")
-                        .about(
-                            "Migrates an upgradeable program to loader-v4",
-                        )
+                        .about("Migrates an upgradeable program to loader-v4")
                         .arg(
                             Arg::with_name("program_id")
                                 .index(1)
@@ -661,8 +669,7 @@ impl ProgramSubCommands for App<'_, '_> {
                                 .takes_value(true)
                                 .validator(is_valid_signer)
                                 .help(
-                                    "Upgrade authority [default: the default configured \
-                                     keypair]",
+                                    "Upgrade authority [default: the default configured keypair]",
                                 ),
                         )
                         .arg(compute_unit_price_arg()),
@@ -1009,17 +1016,22 @@ pub fn parse_program_subcommand(
             let program_pubkey = pubkey_of(matches, "program_id").unwrap();
             let additional_bytes = value_of(matches, "additional_bytes").unwrap();
 
+            let (authority_signer, authority_pubkey) =
+                signer_of(matches, "authority", wallet_manager)?;
+
             let signer_info = default_signer.generate_unique_signers(
-                vec![Some(
-                    default_signer.signer_from_path(matches, wallet_manager)?,
-                )],
+                vec![
+                    Some(default_signer.signer_from_path(matches, wallet_manager)?),
+                    authority_signer,
+                ],
                 matches,
                 wallet_manager,
             )?;
 
             CliCommandInfo {
-                command: CliCommand::Program(ProgramCliCommand::ExtendProgram {
+                command: CliCommand::Program(ProgramCliCommand::ExtendProgramChecked {
                     program_pubkey,
+                    authority_signer_index: signer_info.index_of(authority_pubkey).unwrap(),
                     additional_bytes,
                 }),
                 signers: signer_info.signers,
@@ -1231,10 +1243,17 @@ pub fn process_program_subcommand(
             *use_lamports_unit,
             *bypass_warning,
         ),
-        ProgramCliCommand::ExtendProgram {
+        ProgramCliCommand::ExtendProgramChecked {
             program_pubkey,
+            authority_signer_index,
             additional_bytes,
-        } => process_extend_program(&rpc_client, config, *program_pubkey, *additional_bytes),
+        } => process_extend_program(
+            &rpc_client,
+            config,
+            *program_pubkey,
+            *authority_signer_index,
+            *additional_bytes,
+        ),
         ProgramCliCommand::MigrateProgram {
             program_pubkey,
             authority_signer_index,
@@ -1520,10 +1539,7 @@ fn fetch_verified_buffer_program_data(
     };
 
     verify_elf(&buffer_program_data, feature_set).map_err(|err| {
-        format!(
-            "Buffer account {buffer_pubkey} has invalid program data: {:?}",
-            err
-        )
+        format!("Buffer account {buffer_pubkey} has invalid program data: {err:?}")
     })?;
 
     Ok(buffer_program_data)
@@ -1556,8 +1572,8 @@ fn fetch_buffer_program_data(
         }
         if authority_address != Some(buffer_authority) {
             return Err(format!(
-                "Buffer's authority {:?} does not match authority provided {}",
-                authority_address, buffer_authority
+                "Buffer's authority {authority_address:?} does not match authority provided \
+                 {buffer_authority}"
             )
             .into());
         }
@@ -2366,9 +2382,11 @@ fn process_extend_program(
     rpc_client: &RpcClient,
     config: &CliConfig,
     program_pubkey: Pubkey,
+    authority_signer_index: SignerIndex,
     additional_bytes: u32,
 ) -> ProcessResult {
     let payer_pubkey = config.signers[0].pubkey();
+    let authority_signer = config.signers[authority_signer_index];
 
     if additional_bytes == 0 {
         return Err("Additional bytes must be greater than zero".into());
@@ -2411,23 +2429,39 @@ fn process_extend_program(
         _ => Err(format!("Program {program_pubkey} is closed")),
     }?;
 
-    match upgrade_authority_address {
-        None => Err(format!("Program {program_pubkey} is not upgradeable")),
-        _ => Ok(()),
-    }?;
+    let upgrade_authority_address = upgrade_authority_address
+        .ok_or_else(|| format!("Program {program_pubkey} is not upgradeable"))?;
+
+    if authority_signer.pubkey() != upgrade_authority_address {
+        return Err(format!(
+            "Upgrade authority {} does not match {}",
+            upgrade_authority_address,
+            authority_signer.pubkey(),
+        )
+        .into());
+    }
 
     let blockhash = rpc_client.get_latest_blockhash()?;
+    let feature_set = fetch_feature_set(rpc_client)?;
 
-    let mut tx = Transaction::new_unsigned(Message::new(
-        &[loader_v3_instruction::extend_program(
-            &program_pubkey,
-            Some(&payer_pubkey),
-            additional_bytes,
-        )],
-        Some(&payer_pubkey),
-    ));
+    let instruction =
+        if feature_set.is_active(&agave_feature_set::enable_extend_program_checked::id()) {
+            loader_v3_instruction::extend_program_checked(
+                &program_pubkey,
+                &upgrade_authority_address,
+                Some(&payer_pubkey),
+                additional_bytes,
+            )
+        } else {
+            loader_v3_instruction::extend_program(
+                &program_pubkey,
+                Some(&payer_pubkey),
+                additional_bytes,
+            )
+        };
+    let mut tx = Transaction::new_unsigned(Message::new(&[instruction], Some(&payer_pubkey)));
 
-    tx.try_sign(&[config.signers[0]], blockhash)?;
+    tx.try_sign(&[config.signers[0], authority_signer], blockhash)?;
     let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
         &tx,
         config.commitment,
@@ -2972,14 +3006,25 @@ fn extend_program_data_if_needed(
         return Ok(());
     };
 
+    let upgrade_authority_address = match program_data_account.state() {
+        Ok(UpgradeableLoaderState::ProgramData {
+            slot: _,
+            upgrade_authority_address,
+        }) => Ok(upgrade_authority_address),
+        _ => Err(format!("Program {program_id} is closed")),
+    }?;
+
+    let upgrade_authority_address = upgrade_authority_address
+        .ok_or_else(|| format!("Program {program_id} is not upgradeable"))?;
+
     let required_len = UpgradeableLoaderState::size_of_programdata(program_len);
     let max_permitted_data_length = usize::try_from(MAX_PERMITTED_DATA_LENGTH).unwrap();
     if required_len > max_permitted_data_length {
         let max_program_len = max_permitted_data_length
             .saturating_sub(UpgradeableLoaderState::size_of_programdata(0));
         return Err(format!(
-            "New program ({program_id}) data account is too big: {required_len}.\n\
-             Maximum program size: {max_program_len}.",
+            "New program ({program_id}) data account is too big: {required_len}.\nMaximum program \
+             size: {max_program_len}.",
         )
         .into());
     }
@@ -2993,11 +3038,20 @@ fn extend_program_data_if_needed(
 
     let additional_bytes =
         u32::try_from(additional_bytes).expect("`u32` is big enough to hold an account size");
-    initial_instructions.push(loader_v3_instruction::extend_program(
-        program_id,
-        Some(fee_payer),
-        additional_bytes,
-    ));
+
+    let feature_set = fetch_feature_set(rpc_client)?;
+    let instruction =
+        if feature_set.is_active(&agave_feature_set::enable_extend_program_checked::id()) {
+            loader_v3_instruction::extend_program_checked(
+                program_id,
+                &upgrade_authority_address,
+                Some(fee_payer),
+                additional_bytes,
+            )
+        } else {
+            loader_v3_instruction::extend_program(program_id, Some(fee_payer), additional_bytes)
+        };
+    initial_instructions.push(instruction);
 
     Ok(())
 }
@@ -3024,7 +3078,9 @@ fn verify_elf(
     // Verify the program
     let program_runtime_environment = create_program_runtime_environment_v1(
         &feature_set.runtime_features(),
-        &SVMTransactionExecutionBudget::default(),
+        &SVMTransactionExecutionBudget::new_with_defaults(
+            feature_set.is_active(&raise_cpi_nesting_limit_to_8::id()),
+        ),
         true,
         false,
     )
@@ -3096,7 +3152,12 @@ fn send_deploy_messages(
             // account to sign the transaction. One (transfer) only requires the fee-payer signature.
             // This check is to ensure signing does not fail on a KeypairPubkeyMismatch error from an
             // extraneous signature.
-            if message.header.num_required_signatures == 2 {
+            if message.header.num_required_signatures == 3 {
+                initial_transaction.try_sign(
+                    &[fee_payer_signer, initial_signer, write_signer.unwrap()],
+                    blockhash,
+                )?;
+            } else if message.header.num_required_signatures == 2 {
                 initial_transaction.try_sign(&[fee_payer_signer, initial_signer], blockhash)?;
             } else {
                 initial_transaction.try_sign(&[fee_payer_signer], blockhash)?;
@@ -3192,7 +3253,7 @@ fn send_deploy_messages(
 
             if !transaction_errors.is_empty() {
                 for transaction_error in &transaction_errors {
-                    error!("{:?}", transaction_error);
+                    error!("{transaction_error:?}");
                 }
                 return Err(
                     format!("{} write transactions failed", transaction_errors.len()).into(),
@@ -3659,8 +3720,8 @@ mod tests {
             "test",
             "program",
             "upgrade",
-            format!("{}", buffer_key).as_str(),
-            format!("{}", program_key).as_str(),
+            format!("{buffer_key}").as_str(),
+            format!("{program_key}").as_str(),
             "--skip-feature-verify",
         ]);
         assert_eq!(
@@ -4406,8 +4467,9 @@ mod tests {
         assert_eq!(
             parse_command(&test_command, &default_signer, &mut None).unwrap(),
             CliCommandInfo {
-                command: CliCommand::Program(ProgramCliCommand::ExtendProgram {
+                command: CliCommand::Program(ProgramCliCommand::ExtendProgramChecked {
                     program_pubkey,
+                    authority_signer_index: 0,
                     additional_bytes
                 }),
                 signers: vec![Box::new(read_keypair_file(&keypair_file).unwrap())],

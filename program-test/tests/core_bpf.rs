@@ -1,9 +1,10 @@
 use {
+    solana_instruction::Instruction,
     solana_program_test::{ProgramTest, ProgramTestContext},
-    solana_sdk::{
-        bpf_loader_upgradeable, instruction::Instruction, pubkey::Pubkey, signature::Signer,
-        transaction::Transaction,
-    },
+    solana_pubkey::Pubkey,
+    solana_sdk_ids::bpf_loader_upgradeable,
+    solana_signer::Signer,
+    solana_transaction::Transaction,
 };
 
 async fn assert_bpf_program(context: &ProgramTestContext, program_id: &Pubkey) {
@@ -25,12 +26,13 @@ async fn test_vended_core_bpf_programs() {
     assert_bpf_program(&context, &solana_sdk_ids::address_lookup_table::id()).await;
     assert_bpf_program(&context, &solana_sdk_ids::config::id()).await;
     assert_bpf_program(&context, &solana_sdk_ids::feature::id()).await;
+    assert_bpf_program(&context, &solana_sdk_ids::stake::id()).await;
 }
 
 #[tokio::test]
 async fn test_add_core_bpf_program_manually() {
-    // Core BPF program: Stake.
-    let program_id = solana_sdk_ids::stake::id();
+    // Core BPF program: Vote.
+    let program_id = solana_sdk_ids::vote::id();
 
     let mut program_test = ProgramTest::default();
     program_test.add_upgradeable_program_to_genesis("noop_program", &program_id);

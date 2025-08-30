@@ -7,7 +7,6 @@ use {
         commands,
     },
     log::error,
-    solana_streamer::socket::SocketAddrSpace,
     std::{path::PathBuf, process::exit},
 };
 
@@ -22,14 +21,12 @@ pub fn main() {
     let matches = cli_app.get_matches();
     warn_for_deprecated_arguments(&matches);
 
-    let socket_addr_space = SocketAddrSpace::new(matches.is_present("allow_private_addr"));
     let ledger_path = PathBuf::from(matches.value_of("ledger_path").unwrap());
 
     match matches.subcommand() {
         ("init", _) => commands::run::execute(
             &matches,
             solana_version,
-            socket_addr_space,
             &ledger_path,
             commands::run::execute::Operation::Initialize,
         )
@@ -38,7 +35,6 @@ pub fn main() {
         ("", _) | ("run", _) => commands::run::execute(
             &matches,
             solana_version,
-            socket_addr_space,
             &ledger_path,
             commands::run::execute::Operation::Run,
         )
@@ -77,6 +73,9 @@ pub fn main() {
         }
         ("set-public-address", Some(subcommand_matches)) => {
             commands::set_public_address::execute(subcommand_matches, &ledger_path)
+        }
+        ("manage-block-production", Some(subcommand_matches)) => {
+            commands::manage_block_production::execute(subcommand_matches, &ledger_path)
         }
         _ => unreachable!(),
     }

@@ -4,12 +4,15 @@ use {
         banking_trace::TracedSender, sigverify::TransactionSigVerifier,
         sigverify_stage::SigVerifyStage,
     },
-    solana_net_utils::{multi_bind_in_range_with_config, SocketConfig},
+    solana_keypair::Keypair,
+    solana_net_utils::sockets::{
+        multi_bind_in_range_with_config, SocketConfiguration as SocketConfig,
+    },
     solana_perf::packet::PacketBatch,
-    solana_sdk::{quic::NotifyKeyUpdate, signature::Keypair},
+    solana_quic_definitions::NotifyKeyUpdate,
     solana_streamer::{
         nonblocking::quic::DEFAULT_WAIT_FOR_CHUNK_TIMEOUT,
-        quic::{spawn_server_multi, EndpointKeyUpdater, QuicServerParams},
+        quic::{spawn_server, EndpointKeyUpdater, QuicServerParams},
         streamer::StakedNodes,
     },
     std::{
@@ -60,7 +63,7 @@ impl Vortexor {
         tpu_forward_address: Option<SocketAddr>,
         num_quic_endpoints: usize,
     ) -> TpuSockets {
-        let quic_config = SocketConfig::default().reuseport(true);
+        let quic_config = SocketConfig::default();
 
         let tpu_quic = bind_sockets(
             bind_address,
@@ -85,7 +88,7 @@ impl Vortexor {
     }
 
     pub fn create_sigverify_stage(
-        tpu_receiver: Receiver<solana_perf::packet::PacketBatch>,
+        tpu_receiver: Receiver<PacketBatch>,
         non_vote_sender: TracedSender,
     ) -> SigVerifyStage {
         let verifier = TransactionSigVerifier::new(non_vote_sender, None);
@@ -130,7 +133,7 @@ impl Vortexor {
             tpu_quic_fwd,
         } = tpu_sockets;
 
-        let tpu_result = spawn_server_multi(
+        let tpu_result = spawn_server(
             "solVtxTpu",
             "quic_vortexor_tpu",
             tpu_quic,
@@ -146,7 +149,7 @@ impl Vortexor {
         // for staked connections:
         quic_server_params.max_staked_connections = max_fwd_staked_connections;
         quic_server_params.max_unstaked_connections = max_fwd_unstaked_connections;
-        let tpu_fwd_result = spawn_server_multi(
+        let tpu_fwd_result = spawn_server(
             "solVtxTpuFwd",
             "quic_vortexor_tpu_forwards",
             tpu_quic_fwd,

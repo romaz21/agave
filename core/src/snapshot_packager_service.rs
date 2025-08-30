@@ -1,6 +1,4 @@
-mod pending_snapshot_packages;
 mod snapshot_gossip_manager;
-pub use pending_snapshot_packages::PendingSnapshotPackages;
 use {
     snapshot_gossip_manager::SnapshotGossipManager,
     solana_accounts_db::accounts_db::AccountStorageEntry,
@@ -9,8 +7,9 @@ use {
     solana_measure::{meas_dur, measure::Measure, measure_us},
     solana_perf::thread::renice_this_thread,
     solana_runtime::{
-        snapshot_config::SnapshotConfig, snapshot_controller::SnapshotController,
-        snapshot_hash::StartingSnapshotHashes, snapshot_package::SnapshotPackage, snapshot_utils,
+        accounts_background_service::PendingSnapshotPackages, snapshot_config::SnapshotConfig,
+        snapshot_controller::SnapshotController, snapshot_hash::StartingSnapshotHashes,
+        snapshot_package::SnapshotPackage, snapshot_utils,
     },
     std::{
         sync::{
@@ -18,7 +17,7 @@ use {
             Arc, Mutex,
         },
         thread::{self, Builder, JoinHandle},
-        time::Duration,
+        time::{Duration, Instant},
     },
 };
 
@@ -173,6 +172,8 @@ impl SnapshotPackagerService {
 
     /// Performs final operations before gracefully shutting down
     fn teardown(state: &TeardownState, snapshot_config: &SnapshotConfig) {
+        info!("Flushing account storages...");
+        let start = Instant::now();
         for storage in &state.snapshot_storages {
             let result = storage.flush();
             if let Err(err) = result {
@@ -185,11 +186,31 @@ impl SnapshotPackagerService {
                 return;
             }
         }
+        info!("Flushing account storages... Done in {:?}", start.elapsed());
 
         let bank_snapshot_dir = snapshot_utils::get_bank_snapshot_dir(
             &snapshot_config.bank_snapshots_dir,
             state.snapshot_slot,
         );
+
+        info!("Hard linking account storages...");
+        let start = Instant::now();
+        let result = snapshot_utils::hard_link_storages_to_snapshot(
+            &bank_snapshot_dir,
+            state.snapshot_slot,
+            &state.snapshot_storages,
+        );
+        if let Err(err) = result {
+            warn!("Failed to hard link account storages: {err}");
+            // If hard linking the storages failed, we do *NOT* want to write
+            // the "storages flushed" file, so return early.
+            return;
+        }
+        info!(
+            "Hard linking account storages... Done in {:?}",
+            start.elapsed(),
+        );
+
         let result = snapshot_utils::write_storages_flushed_file(&bank_snapshot_dir);
         if let Err(err) = result {
             warn!("Failed to mark snapshot storages 'flushed': {err}");

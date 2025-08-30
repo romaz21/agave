@@ -28,7 +28,7 @@ use {
         transaction_processor::{ExecutionRecordingConfig, TransactionProcessingConfig},
     },
     solana_transaction_error::TransactionError,
-    std::{num::Saturating, sync::Arc},
+    std::num::Saturating,
 };
 
 /// Consumer will create chunks of transactions from buffer with up to this size.
@@ -94,7 +94,7 @@ impl Consumer {
 
     pub fn process_and_record_transactions(
         &self,
-        bank: &Arc<Bank>,
+        bank: &Bank,
         txs: &[impl TransactionWithMeta],
     ) -> ProcessTransactionBatchOutput {
         let mut error_counters = TransactionErrorMetrics::default();
@@ -124,7 +124,7 @@ impl Consumer {
 
     pub fn process_and_record_aged_transactions(
         &self,
-        bank: &Arc<Bank>,
+        bank: &Bank,
         txs: &[impl TransactionWithMeta],
         max_ages: &[MaxAge],
     ) -> ProcessTransactionBatchOutput {
@@ -159,7 +159,7 @@ impl Consumer {
 
     fn process_and_record_transactions_with_pre_results(
         &self,
-        bank: &Arc<Bank>,
+        bank: &Bank,
         txs: &[impl TransactionWithMeta],
         pre_results: impl Iterator<Item = Result<(), TransactionError>>,
     ) -> ProcessTransactionBatchOutput {
@@ -227,7 +227,7 @@ impl Consumer {
 
     fn execute_and_commit_transactions_locked(
         &self,
-        bank: &Arc<Bank>,
+        bank: &Bank,
         batch: &TransactionBatch<impl TransactionWithMeta>,
     ) -> ExecuteAndCommitTransactionsOutput {
         let transaction_status_sender_enabled = self.committer.transaction_status_sender_enabled();
@@ -401,7 +401,13 @@ impl Consumer {
             } else {
                 (
                     0,
-                    vec![CommitTransactionDetails::NotCommitted; processing_results.len()],
+                    processing_results
+                        .into_iter()
+                        .map(|processing_result| match processing_result {
+                            Ok(_) => unreachable!("processed transaction count is 0"),
+                            Err(err) => CommitTransactionDetails::NotCommitted(err),
+                        })
+                        .collect(),
                 )
             };
 
@@ -467,7 +473,7 @@ impl Consumer {
             &mut fee_payer_account,
             0,
             error_counters,
-            bank.rent_collector(),
+            &bank.rent_collector().rent,
             fee,
         )
     }
@@ -526,11 +532,12 @@ mod tests {
             borrow::Cow,
             sync::{
                 atomic::{AtomicBool, AtomicU64, Ordering},
-                RwLock,
+                Arc, RwLock,
             },
             thread::{Builder, JoinHandle},
             time::Duration,
         },
+        test_case::test_case,
     };
 
     fn execute_transactions_with_dummy_poh_service(
@@ -832,8 +839,8 @@ mod tests {
                     if let Ok(record) = record {
                         let record_response = poh_recorder.write().unwrap().record(
                             record.slot,
-                            record.mixin,
-                            record.transactions,
+                            record.mixins,
+                            record.transaction_batches,
                         );
                         poh_recorder.write().unwrap().tick();
                         if record.sender.send(record_response).is_err() {
@@ -996,7 +1003,12 @@ mod tests {
         assert!(retryable_transaction_indexes.is_empty());
         assert_eq!(
             commit_transactions_result.ok(),
-            Some(vec![CommitTransactionDetails::NotCommitted; 1])
+            Some(vec![
+                CommitTransactionDetails::NotCommitted(
+                    TransactionError::AccountLoadedTwice
+                );
+                1
+            ])
         );
 
         poh_recorder
@@ -1007,8 +1019,11 @@ mod tests {
         let _ = poh_simulator.join();
     }
 
-    #[test]
-    fn test_bank_process_and_record_transactions_cost_tracker() {
+    #[test_case(false; "old")]
+    #[test_case(true; "simd83")]
+    fn test_bank_process_and_record_transactions_cost_tracker(
+        relax_intrabatch_account_locks: bool,
+    ) {
         solana_logger::setup();
         let GenesisConfigInfo {
             genesis_config,
@@ -1016,6 +1031,9 @@ mod tests {
             ..
         } = create_slow_genesis_config(10_000);
         let mut bank = Bank::new_for_tests(&genesis_config);
+        if !relax_intrabatch_account_locks {
+            bank.deactivate_feature(&agave_feature_set::relax_intrabatch_account_locks::id());
+        }
         bank.ns_per_slot = u128::MAX;
         let (bank, _bank_forks) = bank.wrap_with_bank_forks_for_tests();
         let pubkey = solana_pubkey::new_rand();
@@ -1098,6 +1116,14 @@ mod tests {
             system_transaction::transfer(&mint_keypair, &pubkey, 2, genesis_config.hash()),
         ]);
 
+        let conflicting_transaction = sanitize_transactions(vec![system_transaction::transfer(
+            &Keypair::new(),
+            &pubkey,
+            1,
+            genesis_config.hash(),
+        )]);
+        bank.try_lock_accounts(&conflicting_transaction);
+
         let process_transactions_batch_output =
             consumer.process_and_record_transactions(&bank, &transactions);
 
@@ -1120,7 +1146,7 @@ mod tests {
         );
         assert_matches!(
             commit_transactions_result.get(1),
-            Some(CommitTransactionDetails::NotCommitted)
+            Some(CommitTransactionDetails::NotCommitted(_))
         );
         assert_eq!(retryable_transaction_indexes, vec![1]);
 
@@ -1130,6 +1156,8 @@ mod tests {
                     CommitTransactionDetails::Committed {
                         compute_units,
                         loaded_accounts_data_size,
+                        result: _,
+                        fee_payer_post_balance: _,
                     } => (
                         *compute_units,
                         CostModel::calculate_loaded_accounts_data_size_cost(
@@ -1137,7 +1165,7 @@ mod tests {
                             &bank.feature_set,
                         ),
                     ),
-                    CommitTransactionDetails::NotCommitted => {
+                    CommitTransactionDetails::NotCommitted(_err) => {
                         unreachable!()
                     }
                 };
@@ -1162,22 +1190,46 @@ mod tests {
         let _ = poh_simulator.join();
     }
 
-    #[test]
-    fn test_bank_process_and_record_transactions_account_in_use() {
+    #[test_case(false, false; "old::locked")]
+    #[test_case(false, true; "old::duplicate")]
+    #[test_case(true, false; "simd83::locked")]
+    #[test_case(true, true; "simd83::duplicate")]
+    fn test_bank_process_and_record_transactions_account_in_use(
+        relax_intrabatch_account_locks: bool,
+        use_duplicate_transaction: bool,
+    ) {
         solana_logger::setup();
         let GenesisConfigInfo {
             genesis_config,
             mint_keypair,
             ..
         } = create_slow_genesis_config(10_000);
-        let (bank, _bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+        let mut bank = Bank::new_for_tests(&genesis_config);
+        if !relax_intrabatch_account_locks {
+            bank.deactivate_feature(&agave_feature_set::relax_intrabatch_account_locks::id());
+        }
+        bank.ns_per_slot = u128::MAX;
+        let (bank, _bank_forks) = bank.wrap_with_bank_forks_for_tests();
         let pubkey = solana_pubkey::new_rand();
         let pubkey1 = solana_pubkey::new_rand();
 
         let transactions = sanitize_transactions(vec![
             system_transaction::transfer(&mint_keypair, &pubkey, 1, genesis_config.hash()),
-            system_transaction::transfer(&mint_keypair, &pubkey1, 1, genesis_config.hash()),
+            system_transaction::transfer(
+                &mint_keypair,
+                if use_duplicate_transaction {
+                    &pubkey
+                } else {
+                    &pubkey1
+                },
+                1,
+                genesis_config.hash(),
+            ),
         ]);
+        assert_eq!(
+            transactions[0].message_hash() == transactions[1].message_hash(),
+            use_duplicate_transaction
+        );
 
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Blockstore::open(ledger_path.path())
@@ -1212,6 +1264,20 @@ mod tests {
         );
         let consumer = Consumer::new(committer, recorder, QosService::new(1), None);
 
+        // with simd83 and no duplicate, we take a cross-batch lock on an account to create a conflict
+        // with a duplicate transaction and simd83 it comes from message hash equality in the batch
+        // without simd83 the conflict comes from locks in batch
+        if relax_intrabatch_account_locks && !use_duplicate_transaction {
+            let conflicting_transaction =
+                sanitize_transactions(vec![system_transaction::transfer(
+                    &Keypair::new(),
+                    &pubkey1,
+                    1,
+                    genesis_config.hash(),
+                )]);
+            bank.try_lock_accounts(&conflicting_transaction);
+        }
+
         let process_transactions_batch_output =
             consumer.process_and_record_transactions(&bank, &transactions);
 
@@ -1237,8 +1303,14 @@ mod tests {
                 processed_with_successful_result_count: 1,
             }
         );
-        assert_eq!(retryable_transaction_indexes, vec![1]);
         assert!(commit_transactions_result.is_ok());
+
+        // with simd3, duplicate transactions are not retryable
+        if relax_intrabatch_account_locks && use_duplicate_transaction {
+            assert_eq!(retryable_transaction_indexes, Vec::<usize>::new());
+        } else {
+            assert_eq!(retryable_transaction_indexes, vec![1]);
+        }
     }
 
     #[test]
@@ -1297,30 +1369,48 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_process_transactions_account_in_use() {
+    #[test_case(false, false; "old::locked")]
+    #[test_case(false, true; "old::duplicate")]
+    #[test_case(true, false; "simd83::locked")]
+    #[test_case(true, true; "simd83::duplicate")]
+    fn test_process_transactions_account_in_use(
+        relax_intrabatch_account_locks: bool,
+        use_duplicate_transaction: bool,
+    ) {
         solana_logger::setup();
         let GenesisConfigInfo {
             genesis_config,
             mint_keypair,
             ..
         } = create_slow_genesis_config(10_000);
-        let (bank, _bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+        let mut bank = Bank::new_for_tests(&genesis_config);
+        if !relax_intrabatch_account_locks {
+            bank.deactivate_feature(&agave_feature_set::relax_intrabatch_account_locks::id());
+        }
+        bank.ns_per_slot = u128::MAX;
+        let (bank, _bank_forks) = bank.wrap_with_bank_forks_for_tests();
         // set cost tracker limits to MAX so it will not filter out TXs
         bank.write_cost_tracker()
             .unwrap()
             .set_limits(u64::MAX, u64::MAX, u64::MAX);
 
-        // Make all repetitive transactions that conflict on the `mint_keypair`, so only 1 should be executed
-        let transactions = vec![
-            system_transaction::transfer(
+        let mut transactions = vec![];
+        let destination = Pubkey::new_unique();
+        let mut amount = 1;
+
+        // Make distinct, or identical, transactions that conflict on the `mint_keypair`
+        for _ in 0..TARGET_NUM_TRANSACTIONS_PER_BATCH {
+            transactions.push(system_transaction::transfer(
                 &mint_keypair,
-                &Pubkey::new_unique(),
-                1,
-                genesis_config.hash()
-            );
-            TARGET_NUM_TRANSACTIONS_PER_BATCH
-        ];
+                &destination,
+                amount,
+                genesis_config.hash(),
+            ));
+
+            if !use_duplicate_transaction {
+                amount += 1;
+            }
+        }
 
         let transactions_len = transactions.len();
         let ProcessTransactionBatchOutput {
@@ -1328,7 +1418,14 @@ mod tests {
             ..
         } = execute_transactions_with_dummy_poh_service(bank, transactions);
 
-        // All the transactions should have been replayed, but only 2 committed (first and last)
+        // If SIMD-83 is enabled *and* the transactions are distinct, all are executed.
+        // In the three other cases, only one is executed. In all four cases, all are attempted.
+        let execution_count = if relax_intrabatch_account_locks && !use_duplicate_transaction {
+            transactions_len
+        } else {
+            1
+        } as u64;
+
         assert_eq!(
             execute_and_commit_transactions_output
                 .transaction_counts
@@ -1339,20 +1436,29 @@ mod tests {
             execute_and_commit_transactions_output
                 .transaction_counts
                 .processed_count,
-            1
+            execution_count
         );
         assert_eq!(
             execute_and_commit_transactions_output
                 .transaction_counts
                 .processed_with_successful_result_count,
-            1
+            execution_count
         );
 
-        // Everything except first of the transactions failed and are retryable
-        assert_eq!(
-            execute_and_commit_transactions_output.retryable_transaction_indexes,
-            (1..transactions_len).collect::<Vec<usize>>()
-        );
+        // If SIMD-83 is enabled and the transactions are distinct, there are zero retryable (all executed).
+        // If SIMD-83 is enabled and the transactions are identical, there are zero retryable (marked AlreadyProcessed).
+        // If SIMD-83 is not enabled, all but the first are retryable (marked AccountInUse).
+        if relax_intrabatch_account_locks {
+            assert_eq!(
+                execute_and_commit_transactions_output.retryable_transaction_indexes,
+                Vec::<usize>::new()
+            );
+        } else {
+            assert_eq!(
+                execute_and_commit_transactions_output.retryable_transaction_indexes,
+                (1..transactions_len).collect::<Vec<usize>>()
+            );
+        }
     }
 
     #[test]
@@ -1455,7 +1561,7 @@ mod tests {
             mut genesis_config,
             mint_keypair,
             ..
-        } = create_slow_genesis_config(solana_native_token::sol_to_lamports(1000.0));
+        } = create_slow_genesis_config(solana_native_token::LAMPORTS_PER_SOL * 1000);
         genesis_config.rent.lamports_per_byte_year = 50;
         genesis_config.rent.exemption_threshold = 2.0;
         let (bank, _bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
@@ -1519,7 +1625,6 @@ mod tests {
             0,    // parent_slot
             true, // is_full_slot
             0,    // version
-            true, // merkle_variant
         );
         blockstore.insert_shreds(shreds, None, false).unwrap();
         blockstore.set_roots(std::iter::once(&bank.slot())).unwrap();
@@ -1533,6 +1638,7 @@ mod tests {
             None,
             blockstore.clone(),
             false,
+            None, // no work dependency tracker
             tss_exit.clone(),
         );
 
@@ -1540,6 +1646,7 @@ mod tests {
         let committer = Committer::new(
             Some(TransactionStatusSender {
                 sender: transaction_status_sender,
+                dependency_tracker: None,
             }),
             replay_vote_sender,
             Arc::new(PrioritizationFeeCache::new(0u64)),
@@ -1664,7 +1771,6 @@ mod tests {
             0,    // parent_slot
             true, // is_full_slot
             0,    // version
-            true, // merkle_variant
         );
         blockstore.insert_shreds(shreds, None, false).unwrap();
         blockstore.set_roots(std::iter::once(&bank.slot())).unwrap();
@@ -1678,6 +1784,7 @@ mod tests {
             None,
             blockstore.clone(),
             false,
+            None, // no work dependency tracker
             tss_exit.clone(),
         );
 
@@ -1685,6 +1792,7 @@ mod tests {
         let committer = Committer::new(
             Some(TransactionStatusSender {
                 sender: transaction_status_sender,
+                dependency_tracker: None,
             }),
             replay_vote_sender,
             Arc::new(PrioritizationFeeCache::new(0u64)),
@@ -1696,6 +1804,8 @@ mod tests {
         let CommitTransactionDetails::Committed {
             compute_units,
             loaded_accounts_data_size,
+            result: _,
+            fee_payer_post_balance: _,
         } = consumer_output
             .execute_and_commit_transactions_output
             .commit_transactions_result

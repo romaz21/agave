@@ -10,8 +10,7 @@ use {
     agave_banking_stage_ingress_types::BankingPacketReceiver,
     crossbeam_channel::RecvTimeoutError,
     solana_measure::{measure::Measure, measure_us},
-    solana_sdk::saturating_add_assign,
-    std::{sync::atomic::Ordering, time::Duration},
+    std::{num::Saturating, sync::atomic::Ordering, time::Duration},
 };
 
 pub struct PacketReceiver {
@@ -37,11 +36,7 @@ impl PacketReceiver {
             let recv_timeout = Self::get_receive_timeout(vote_storage);
             let mut recv_and_buffer_measure = Measure::start("recv_and_buffer");
             self.packet_deserializer
-                .receive_packets(recv_timeout, vote_storage.max_receive_size(), |packet| {
-                    packet.check_insufficent_compute_unit_limit()?;
-                    packet.check_excessive_precompiles()?;
-                    Ok(packet)
-                })
+                .receive_packets(recv_timeout, vote_storage.max_receive_size())
                 // Consumes results if Ok, otherwise we keep the Err
                 .map(|receive_packet_results| {
                     self.buffer_packets(
@@ -93,7 +88,7 @@ impl PacketReceiver {
 
         slot_metrics_tracker.increment_received_packet_counts(packet_stats);
 
-        let mut dropped_packets_count = 0;
+        let mut dropped_packets_count = Saturating(0);
         let mut newly_buffered_packets_count = 0;
         let mut newly_buffered_forwarded_packets_count = 0;
         Self::push_unprocessed(
@@ -115,9 +110,12 @@ impl PacketReceiver {
         vote_source_counts
             .receive_and_buffer_packets_count
             .fetch_add(packet_count, Ordering::Relaxed);
-        vote_source_counts
-            .dropped_packets_count
-            .fetch_add(dropped_packets_count, Ordering::Relaxed);
+        {
+            let Saturating(dropped_packets_count) = dropped_packets_count;
+            vote_source_counts
+                .dropped_packets_count
+                .fetch_add(dropped_packets_count, Ordering::Relaxed);
+        }
         vote_source_counts
             .newly_buffered_packets_count
             .fetch_add(newly_buffered_packets_count, Ordering::Relaxed);
@@ -130,7 +128,7 @@ impl PacketReceiver {
         vote_storage: &mut VoteStorage,
         vote_source: VoteSource,
         deserialized_packets: Vec<ImmutableDeserializedPacket>,
-        dropped_packets_count: &mut usize,
+        dropped_packets_count: &mut Saturating<usize>,
         newly_buffered_packets_count: &mut usize,
         newly_buffered_forwarded_packets_count: &mut usize,
         banking_stage_stats: &mut BankingStageStats,
@@ -153,10 +151,7 @@ impl PacketReceiver {
                 vote_storage.insert_batch(vote_source, deserialized_packets.into_iter());
             slot_metrics_tracker
                 .accumulate_vote_batch_insertion_metrics(&vote_batch_insertion_metrics);
-            saturating_add_assign!(
-                *dropped_packets_count,
-                vote_batch_insertion_metrics.total_dropped_packets()
-            );
+            *dropped_packets_count += vote_batch_insertion_metrics.total_dropped_packets();
         }
     }
 }

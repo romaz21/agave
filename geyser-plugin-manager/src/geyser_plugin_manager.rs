@@ -60,12 +60,6 @@ pub struct GeyserPluginManager {
 }
 
 impl GeyserPluginManager {
-    pub fn new() -> Self {
-        GeyserPluginManager {
-            plugins: Vec::default(),
-        }
-    }
-
     /// Unload all plugins and loaded plugin libraries, making sure to fire
     /// their `on_plugin_unload()` methods so they can do any necessary cleanup.
     pub fn unload(&mut self) {
@@ -238,7 +232,8 @@ impl GeyserPluginManager {
             return Err(jsonrpc_core::Error {
                 code: ErrorCode::InvalidRequest,
                 message: format!(
-                    "There already exists a plugin named {} loaded, while reloading {name}. Did not load requested plugin",
+                    "There already exists a plugin named {} loaded, while reloading {name}. Did \
+                     not load requested plugin",
                     new_plugin.name()
                 ),
                 data: None,
@@ -357,7 +352,8 @@ pub(crate) fn load_plugin_from_config(
         Ok(file) => file,
         Err(err) => {
             return Err(GeyserPluginManagerError::CannotOpenConfigFile(format!(
-                "Failed to open the plugin config file {geyser_plugin_config_file:?}, error: {err:?}"
+                "Failed to open the plugin config file {geyser_plugin_config_file:?}, error: \
+                 {err:?}"
             )));
         }
     };
@@ -373,7 +369,8 @@ pub(crate) fn load_plugin_from_config(
         Ok(value) => value,
         Err(err) => {
             return Err(GeyserPluginManagerError::InvalidConfigFileFormat(format!(
-                "The config file {geyser_plugin_config_file:?} is not in a valid Json5 format, error: {err:?}"
+                "The config file {geyser_plugin_config_file:?} is not in a valid Json5 format, \
+                 error: {err:?}"
             )));
         }
     };
@@ -494,7 +491,7 @@ mod tests {
     #[test]
     fn test_geyser_reload() {
         // Initialize empty manager
-        let plugin_manager = Arc::new(RwLock::new(GeyserPluginManager::new()));
+        let plugin_manager = Arc::new(RwLock::new(GeyserPluginManager::default()));
 
         // No plugins are loaded, this should fail
         let mut plugin_manager_lock = plugin_manager.write().unwrap();
@@ -533,7 +530,7 @@ mod tests {
     #[test]
     fn test_plugin_list() {
         // Initialize empty manager
-        let plugin_manager = Arc::new(RwLock::new(GeyserPluginManager::new()));
+        let plugin_manager = Arc::new(RwLock::new(GeyserPluginManager::default()));
         let mut plugin_manager_lock = plugin_manager.write().unwrap();
 
         // Load two plugins
@@ -555,7 +552,7 @@ mod tests {
     #[test]
     fn test_plugin_load_unload() {
         // Initialize empty manager
-        let plugin_manager = Arc::new(RwLock::new(GeyserPluginManager::new()));
+        let plugin_manager = Arc::new(RwLock::new(GeyserPluginManager::default()));
         let mut plugin_manager_lock = plugin_manager.write().unwrap();
 
         // Load rpc call

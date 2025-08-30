@@ -1,9 +1,6 @@
 #![cfg_attr(feature = "frozen-abi", feature(min_specialization))]
 #![allow(clippy::arithmetic_side_effects)]
 
-#[macro_use]
-extern crate lazy_static;
-
 mod account_saver;
 pub mod accounts_background_service;
 pub mod bank;
@@ -12,6 +9,7 @@ pub mod bank_forks;
 pub mod bank_hash_cache;
 pub mod bank_utils;
 pub mod commitment;
+pub mod dependency_tracker;
 pub mod epoch_stakes;
 pub mod genesis_utils;
 pub mod inflation_rewards;
@@ -21,7 +19,6 @@ pub mod non_circulating_supply;
 pub mod prioritization_fee;
 pub mod prioritization_fee_cache;
 pub mod rent_collector;
-pub mod root_bank_cache;
 pub mod runtime_config;
 pub mod serde_snapshot;
 pub mod snapshot_archive_info;

@@ -4,8 +4,7 @@ use {
     super::{
         scheduler::{PreLockFilterAction, Scheduler, SchedulingSummary},
         scheduler_common::{
-            select_thread, Batches, SchedulingCommon, TransactionSchedulingError,
-            TransactionSchedulingInfo,
+            select_thread, SchedulingCommon, TransactionSchedulingError, TransactionSchedulingInfo,
         },
         scheduler_error::SchedulerError,
         thread_aware_account_locks::{ThreadAwareAccountLocks, ThreadId, ThreadSet, TryLockError},
@@ -21,7 +20,7 @@ use {
     crossbeam_channel::{Receiver, Sender},
     solana_cost_model::block_cost_limits::MAX_BLOCK_UNITS,
     solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
-    solana_sdk::saturating_add_assign,
+    std::num::Saturating,
 };
 
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
@@ -59,9 +58,13 @@ impl<Tx: TransactionWithMeta> GreedyScheduler<Tx> {
         config: GreedySchedulerConfig,
     ) -> Self {
         Self {
-            common: SchedulingCommon::new(consume_work_senders, finished_consume_work_receiver),
             working_account_set: ReadWriteAccountSet::default(),
             unschedulables: Vec::with_capacity(config.max_scanned_transactions_per_scheduling_pass),
+            common: SchedulingCommon::new(
+                consume_work_senders,
+                finished_consume_work_receiver,
+                config.target_transactions_per_batch,
+            ),
             config,
         }
     }
@@ -96,14 +99,19 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
             });
         }
 
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            self.common.batches.is_empty(),
+            "batches must start empty for scheduling"
+        );
+
         // Track metrics on filter.
         let mut num_scanned: usize = 0;
-        let mut num_scheduled: usize = 0;
+        let mut num_scheduled = Saturating::<usize>(0);
         let mut num_sent: usize = 0;
         let mut num_unschedulable_conflicts: usize = 0;
         let mut num_unschedulable_threads: usize = 0;
 
-        let mut batches = Batches::new(num_threads, self.config.target_transactions_per_batch);
         while num_scanned < self.config.max_scanned_transactions_per_scheduling_pass
             && !schedulable_threads.is_empty()
             && !container.is_empty()
@@ -127,9 +135,7 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
                 .check_locks(transaction_state.transaction())
             {
                 self.working_account_set.clear();
-                num_sent += self
-                    .common
-                    .send_batches(&mut batches, self.config.target_transactions_per_batch)?;
+                num_sent += self.common.send_batches()?;
             }
 
             // Now check if the transaction can actually be scheduled.
@@ -141,9 +147,9 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
                 |thread_set| {
                     select_thread(
                         thread_set,
-                        batches.total_cus(),
+                        self.common.batches.total_cus(),
                         self.common.in_flight_tracker.cus_in_flight_per_thread(),
-                        batches.transactions(),
+                        self.common.batches.transactions(),
                         self.common.in_flight_tracker.num_in_flight_per_thread(),
                     )
                 },
@@ -166,24 +172,27 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
                         self.working_account_set.take_locks(&transaction),
                         "locks must be available"
                     );
-                    saturating_add_assign!(num_scheduled, 1);
-                    batches.add_transaction_to_batch(thread_id, id.id, transaction, max_age, cost);
+                    num_scheduled += 1;
+                    self.common.batches.add_transaction_to_batch(
+                        thread_id,
+                        id.id,
+                        transaction,
+                        max_age,
+                        cost,
+                    );
 
                     // If target batch size is reached, send all the batches
-                    if batches.transactions()[thread_id].len()
+                    if self.common.batches.transactions()[thread_id].len()
                         >= self.config.target_transactions_per_batch
                     {
                         self.working_account_set.clear();
-                        num_sent += self.common.send_batches(
-                            &mut batches,
-                            self.config.target_transactions_per_batch,
-                        )?;
+                        num_sent += self.common.send_batches()?;
                     }
 
                     // if the thread is at target_cu_per_thread, remove it from the schedulable threads
                     // if there are no more schedulable threads, stop scheduling.
                     if self.common.in_flight_tracker.cus_in_flight_per_thread()[thread_id]
-                        + batches.total_cus()[thread_id]
+                        + self.common.batches.total_cus()[thread_id]
                         >= target_cu_per_thread
                     {
                         schedulable_threads.remove(thread_id);
@@ -196,8 +205,8 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
         }
 
         self.working_account_set.clear();
-        // Use zero here to avoid allocating since we are done with `Batches`.
-        num_sent += self.common.send_batches(&mut batches, 0)?;
+        num_sent += self.common.send_batches()?;
+        let Saturating(num_scheduled) = num_scheduled;
         assert_eq!(
             num_scheduled, num_sent,
             "number of scheduled and sent transactions must match"
@@ -281,12 +290,12 @@ mod test {
         },
         crossbeam_channel::unbounded,
         itertools::Itertools,
-        solana_pubkey::Pubkey,
-        solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
         solana_compute_budget_interface::ComputeBudgetInstruction,
         solana_hash::Hash,
-        solana_message::Message,
         solana_keypair::Keypair,
+        solana_message::Message,
+        solana_pubkey::Pubkey,
+        solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
         solana_signer::Signer,
         solana_system_interface::instruction as system_instruction,
         solana_transaction::{sanitized::SanitizedTransaction, Transaction},

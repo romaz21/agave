@@ -1,6 +1,7 @@
 pub mod authorized_voter;
 pub mod contact_info;
 pub mod exit;
+pub mod manage_block_production;
 pub mod monitor;
 pub mod plugin;
 pub mod repair_shred_from_peer;
@@ -27,6 +28,9 @@ pub enum Error {
 
     #[error(transparent)]
     Io(#[from] std::io::Error),
+
+    #[error(transparent)]
+    TryFromInt(#[from] std::num::TryFromIntError),
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -46,7 +50,7 @@ pub mod tests {
     {
         let matches = app.get_matches_from(vec);
         let result = T::from_clap_arg_match(&matches);
-        assert_eq!(result.unwrap(), expected_arg);
+        pretty_assertions::assert_eq!(result.unwrap(), expected_arg);
     }
 
     pub fn verify_args_struct_by_command_is_error<T>(app: clap::App, vec: Vec<&str>)

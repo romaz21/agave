@@ -10,7 +10,7 @@ use {
         quic::{configure_server, QuicServerError, QuicServerParams, StreamerStats},
         streamer::StakedNodes,
     },
-    bytes::Bytes,
+    bytes::{BufMut, Bytes, BytesMut},
     crossbeam_channel::{bounded, Receiver, Sender, TrySendError},
     futures::{stream::FuturesUnordered, Future, StreamExt as _},
     indexmap::map::{Entry, IndexMap},
@@ -22,13 +22,13 @@ use {
     solana_keypair::Keypair,
     solana_measure::measure::Measure,
     solana_packet::{Meta, PACKET_DATA_SIZE},
-    solana_perf::packet::{PacketBatch, PacketBatchRecycler, PACKETS_PER_BATCH},
+    solana_perf::packet::{BytesPacket, BytesPacketBatch, PacketBatch, PACKETS_PER_BATCH},
     solana_pubkey::Pubkey,
     solana_quic_definitions::{
-        QUIC_CONNECTION_HANDSHAKE_TIMEOUT, QUIC_MAX_STAKED_CONCURRENT_STREAMS,
-        QUIC_MAX_STAKED_RECEIVE_WINDOW_RATIO, QUIC_MAX_UNSTAKED_CONCURRENT_STREAMS,
-        QUIC_MIN_STAKED_CONCURRENT_STREAMS, QUIC_MIN_STAKED_RECEIVE_WINDOW_RATIO,
-        QUIC_TOTAL_STAKED_CONCURRENT_STREAMS, QUIC_UNSTAKED_RECEIVE_WINDOW_RATIO,
+        QUIC_MAX_STAKED_CONCURRENT_STREAMS, QUIC_MAX_STAKED_RECEIVE_WINDOW_RATIO,
+        QUIC_MAX_UNSTAKED_CONCURRENT_STREAMS, QUIC_MIN_STAKED_CONCURRENT_STREAMS,
+        QUIC_MIN_STAKED_RECEIVE_WINDOW_RATIO, QUIC_TOTAL_STAKED_CONCURRENT_STREAMS,
+        QUIC_UNSTAKED_RECEIVE_WINDOW_RATIO,
     },
     solana_signature::Signature,
     solana_time_utils as timing,
@@ -85,21 +85,6 @@ const CONNECTION_CLOSE_REASON_TOO_MANY: &[u8] = b"too_many";
 const CONNECTION_CLOSE_CODE_INVALID_STREAM: u32 = 5;
 const CONNECTION_CLOSE_REASON_INVALID_STREAM: &[u8] = b"invalid_stream";
 
-/// The new connections per minute from a particular IP address.
-/// Heuristically set to the default maximum concurrent connections
-/// per IP address. Might be adjusted later.
-#[deprecated(
-    since = "2.2.0",
-    note = "Use solana_streamer::quic::DEFAULT_MAX_CONNECTIONS_PER_IPADDR_PER_MINUTE"
-)]
-pub use crate::quic::DEFAULT_MAX_CONNECTIONS_PER_IPADDR_PER_MINUTE;
-/// Limit to 250K PPS
-#[deprecated(
-    since = "2.2.0",
-    note = "Use solana_streamer::quic::DEFAULT_MAX_STREAMS_PER_MS"
-)]
-pub use crate::quic::DEFAULT_MAX_STREAMS_PER_MS;
-
 /// Total new connection counts per second. Heuristically taken from
 /// the default staked and unstaked connection limits. Might be adjusted
 /// later.
@@ -109,6 +94,10 @@ const TOTAL_CONNECTIONS_PER_SECOND: u64 = 2500;
 /// the map size is above this, we will trigger a cleanup of older
 /// entries used by past requests.
 const CONNECTION_RATE_LIMITER_CLEANUP_SIZE_THRESHOLD: usize = 100_000;
+
+/// Timeout for connection handshake. Timer starts once we get Initial from the
+/// peer, and is canceled when we get a Handshake packet from them.
+const QUIC_CONNECTION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 
 // A struct to accumulate the bytes making up
 // a packet, along with their offsets, and the
@@ -151,18 +140,19 @@ pub struct SpawnNonBlockingServerResult {
     pub max_concurrent_connections: usize,
 }
 
-pub fn spawn_server(
+#[deprecated(since = "3.0.0", note = "Use spawn_server instead")]
+pub fn spawn_server_multi(
     name: &'static str,
-    sock: UdpSocket,
+    sockets: impl IntoIterator<Item = UdpSocket>,
     keypair: &Keypair,
     packet_sender: Sender<PacketBatch>,
     exit: Arc<AtomicBool>,
     staked_nodes: Arc<RwLock<StakedNodes>>,
     quic_server_params: QuicServerParams,
 ) -> Result<SpawnNonBlockingServerResult, QuicServerError> {
-    spawn_server_multi(
+    spawn_server(
         name,
-        vec![sock],
+        sockets,
         keypair,
         packet_sender,
         exit,
@@ -171,15 +161,17 @@ pub fn spawn_server(
     )
 }
 
-pub fn spawn_server_multi(
+/// Spawn a streamer instance in the current tokio runtime.
+pub fn spawn_server(
     name: &'static str,
-    sockets: Vec<UdpSocket>,
+    sockets: impl IntoIterator<Item = UdpSocket>,
     keypair: &Keypair,
     packet_sender: Sender<PacketBatch>,
     exit: Arc<AtomicBool>,
     staked_nodes: Arc<RwLock<StakedNodes>>,
     quic_server_params: QuicServerParams,
 ) -> Result<SpawnNonBlockingServerResult, QuicServerError> {
+    let sockets: Vec<_> = sockets.into_iter().collect();
     info!("Start {name} quic server on {sockets:?}");
     let QuicServerParams {
         max_unstaked_connections,
@@ -190,6 +182,7 @@ pub fn spawn_server_multi(
         wait_for_chunk_timeout,
         coalesce,
         coalesce_channel_size,
+        num_threads: _,
     } = quic_server_params;
     let concurrent_connections = max_staked_connections + max_unstaked_connections;
     let max_concurrent_connections = concurrent_connections + concurrent_connections / 4;
@@ -268,8 +261,8 @@ impl ClientConnectionTracker {
         if open_connections >= max_concurrent_connections {
             stats.open_connections.fetch_sub(1, Ordering::Relaxed);
             debug!(
-                "There are too many concurrent connections opened already: open: {}, max: {}",
-                open_connections, max_concurrent_connections
+                "There are too many concurrent connections opened already: open: \
+                 {open_connections}, max: {max_concurrent_connections}"
             );
             return Err(());
         }
@@ -296,9 +289,12 @@ async fn run_server(
     coalesce_channel_size: usize,
     max_concurrent_connections: usize,
 ) {
-    let rate_limiter = ConnectionRateLimiter::new(max_connections_per_ipaddr_per_min);
-    let overall_connection_rate_limiter =
-        TotalConnectionRateLimiter::new(TOTAL_CONNECTIONS_PER_SECOND);
+    let rate_limiter = Arc::new(ConnectionRateLimiter::new(
+        max_connections_per_ipaddr_per_min,
+    ));
+    let overall_connection_rate_limiter = Arc::new(TotalConnectionRateLimiter::new(
+        TOTAL_CONNECTIONS_PER_SECOND,
+    ));
 
     const WAIT_FOR_CONNECTION_TIMEOUT: Duration = Duration::from_secs(1);
     debug!("spawn quic server");
@@ -367,8 +363,6 @@ async fn run_server(
                 .total_incoming_connection_attempts
                 .fetch_add(1, Ordering::Relaxed);
 
-            let remote_address = incoming.remote_address();
-
             // first do per IpAddr rate limiting
             if rate_limiter.len() > CONNECTION_RATE_LIMITER_CLEANUP_SIZE_THRESHOLD {
                 rate_limiter.retain_recent();
@@ -376,31 +370,6 @@ async fn run_server(
             stats
                 .connection_rate_limiter_length
                 .store(rate_limiter.len(), Ordering::Relaxed);
-            debug!("Got a connection {remote_address:?}");
-            if !rate_limiter.is_allowed(&remote_address.ip()) {
-                debug!(
-                    "Reject connection from {:?} -- rate limiting exceeded",
-                    remote_address
-                );
-                stats
-                    .connection_rate_limited_per_ipaddr
-                    .fetch_add(1, Ordering::Relaxed);
-                incoming.ignore();
-                continue;
-            }
-
-            // then check overall connection rate limit:
-            if !overall_connection_rate_limiter.is_allowed() {
-                debug!(
-                    "Reject connection from {:?} -- total rate limiting exceeded",
-                    remote_address.ip()
-                );
-                stats
-                    .connection_rate_limited_across_all
-                    .fetch_add(1, Ordering::Relaxed);
-                incoming.ignore();
-                continue;
-            }
 
             let Ok(client_connection_tracker) =
                 ClientConnectionTracker::new(stats.clone(), max_concurrent_connections)
@@ -418,8 +387,12 @@ async fn run_server(
             let connecting = incoming.accept();
             match connecting {
                 Ok(connecting) => {
+                    let rate_limiter = rate_limiter.clone();
+                    let overall_connection_rate_limiter = overall_connection_rate_limiter.clone();
                     tokio::spawn(setup_connection(
                         connecting,
+                        rate_limiter,
+                        overall_connection_rate_limiter,
                         client_connection_tracker,
                         unstaked_connection_table.clone(),
                         staked_connection_table.clone(),
@@ -435,7 +408,10 @@ async fn run_server(
                     ));
                 }
                 Err(err) => {
-                    debug!("Incoming::accept(): error {:?}", err);
+                    stats
+                        .outstanding_incoming_connection_attempts
+                        .fetch_sub(1, Ordering::Relaxed);
+                    debug!("Incoming::accept(): error {err:?}");
                 }
             }
         } else {
@@ -486,14 +462,14 @@ fn get_connection_stake(
     ))
 }
 
-pub fn compute_max_allowed_uni_streams(peer_type: ConnectionPeerType, total_stake: u64) -> usize {
+fn compute_max_allowed_uni_streams(peer_type: ConnectionPeerType, total_stake: u64) -> usize {
     match peer_type {
         ConnectionPeerType::Staked(peer_stake) => {
             // No checked math for f64 type. So let's explicitly check for 0 here
             if total_stake == 0 || peer_stake > total_stake {
                 warn!(
-                    "Invalid stake values: peer_stake: {:?}, total_stake: {:?}",
-                    peer_stake, total_stake,
+                    "Invalid stake values: peer_stake: {peer_stake:?}, total_stake: \
+                     {total_stake:?}"
                 );
 
                 QUIC_MIN_STAKED_CONCURRENT_STREAMS
@@ -520,11 +496,6 @@ enum ConnectionHandlerError {
 
 #[derive(Clone)]
 struct NewConnectionHandlerParams {
-    // In principle, the code can be made to work with a crossbeam channel
-    // as long as we're careful never to use a blocking recv or send call
-    // but I've found that it's simply too easy to accidentally block
-    // in async code when using the crossbeam channel, so for the sake of maintainability,
-    // we're sticking with an async channel
     packet_sender: Sender<PacketAccumulator>,
     remote_pubkey: Option<Pubkey>,
     peer_type: ConnectionPeerType,
@@ -709,6 +680,8 @@ fn compute_recieve_window(
 #[allow(clippy::too_many_arguments)]
 async fn setup_connection(
     connecting: Connecting,
+    rate_limiter: Arc<ConnectionRateLimiter>,
+    overall_connection_rate_limiter: Arc<TotalConnectionRateLimiter>,
     client_connection_tracker: ClientConnectionTracker,
     unstaked_connection_table: Arc<Mutex<ConnectionTable>>,
     staked_connection_table: Arc<Mutex<ConnectionTable>>,
@@ -731,7 +704,34 @@ async fn setup_connection(
     if let Ok(connecting_result) = res {
         match connecting_result {
             Ok(new_connection) => {
+                debug!("Got a connection {from:?}");
+                if !rate_limiter.is_allowed(&from.ip()) {
+                    debug!("Reject connection from {from:?} -- rate limiting exceeded");
+                    stats
+                        .connection_rate_limited_per_ipaddr
+                        .fetch_add(1, Ordering::Relaxed);
+                    new_connection.close(
+                        CONNECTION_CLOSE_CODE_DISALLOWED.into(),
+                        CONNECTION_CLOSE_REASON_DISALLOWED,
+                    );
+                    return;
+                }
                 stats.total_new_connections.fetch_add(1, Ordering::Relaxed);
+
+                if !overall_connection_rate_limiter.is_allowed() {
+                    debug!(
+                        "Reject connection from {:?} -- total rate limiting exceeded",
+                        from.ip()
+                    );
+                    stats
+                        .connection_rate_limited_across_all
+                        .fetch_add(1, Ordering::Relaxed);
+                    new_connection.close(
+                        CONNECTION_CLOSE_CODE_DISALLOWED.into(),
+                        CONNECTION_CLOSE_REASON_DISALLOWED,
+                    );
+                    return;
+                }
 
                 let params = get_connection_stake(&new_connection, &staked_nodes).map_or(
                     NewConnectionHandlerParams::new_unstaked(
@@ -851,7 +851,7 @@ async fn setup_connection(
 }
 
 fn handle_connection_error(e: quinn::ConnectionError, stats: &StreamerStats, from: SocketAddr) {
-    debug!("error: {:?} from: {:?}", e, from);
+    debug!("error: {e:?} from: {from:?}");
     stats.connection_setup_error.fetch_add(1, Ordering::Relaxed);
     match e {
         quinn::ConnectionError::TimedOut => {
@@ -898,12 +898,10 @@ fn packet_batch_sender(
     coalesce: Duration,
 ) {
     trace!("enter packet_batch_sender");
-    let recycler = PacketBatchRecycler::default();
     let mut batch_start_time = Instant::now();
     loop {
         let mut packet_perf_measure: Vec<([u8; 64], Instant)> = Vec::default();
-        let mut packet_batch =
-            PacketBatch::new_with_recycler(&recycler, PACKETS_PER_BATCH, "quic_packet_coalescer");
+        let mut packet_batch = BytesPacketBatch::with_capacity(PACKETS_PER_BATCH);
         let mut total_bytes: usize = 0;
 
         stats
@@ -924,11 +922,11 @@ fn packet_batch_sender(
                 let len = packet_batch.len();
                 track_streamer_fetch_packet_performance(&packet_perf_measure, &stats);
 
-                if let Err(e) = packet_sender.try_send(packet_batch) {
+                if let Err(e) = packet_sender.try_send(packet_batch.into()) {
                     stats
                         .total_packet_batch_send_err
                         .fetch_add(1, Ordering::Relaxed);
-                    trace!("Send error: {}", e);
+                    trace!("Send error: {e}");
 
                     // The downstream channel is disconnected, this error is not recoverable.
                     if matches!(e, TrySendError::Disconnected(_)) {
@@ -948,7 +946,7 @@ fn packet_batch_sender(
                         .total_bytes_sent_to_consumer
                         .fetch_add(total_bytes, Ordering::Relaxed);
 
-                    trace!("Sent {} packet batch", len);
+                    trace!("Sent {len} packet batch");
                 }
                 break;
             }
@@ -969,37 +967,41 @@ fn packet_batch_sender(
                     .map_err(|_| crossbeam_channel::RecvTimeoutError::Disconnected)
             };
 
-            if let Ok(packet_accumulator) = timeout_res {
+            if let Ok(mut packet_accumulator) = timeout_res {
                 // Start the timeout from when the packet batch first becomes non-empty
                 if packet_batch.is_empty() {
                     batch_start_time = Instant::now();
                 }
 
-                unsafe {
-                    let new_len = packet_batch.len() + 1;
-                    packet_batch.set_len(new_len);
-                }
-
-                let i = packet_batch.len() - 1;
-                *packet_batch[i].meta_mut() = packet_accumulator.meta;
+                // 86% of transactions/packets come in one chunk. In that case,
+                // we can just move the chunk to the `Packet` and no copy is
+                // made.
+                // 14% of them come in multiple chunks. In that case, we copy
+                // them into one `Bytes` buffer. We make a copy once, with
+                // intention to not do it again.
                 let num_chunks = packet_accumulator.chunks.len();
-                let mut offset = 0;
-                for chunk in packet_accumulator.chunks {
-                    packet_batch[i].buffer_mut()[offset..offset + chunk.len()]
-                        .copy_from_slice(&chunk);
-                    offset += chunk.len();
-                }
+                let mut packet = if packet_accumulator.chunks.len() == 1 {
+                    BytesPacket::new(
+                        packet_accumulator.chunks.pop().expect("expected one chunk"),
+                        packet_accumulator.meta,
+                    )
+                } else {
+                    let size: usize = packet_accumulator.chunks.iter().map(Bytes::len).sum();
+                    let mut buf = BytesMut::with_capacity(size);
+                    for chunk in packet_accumulator.chunks {
+                        buf.put_slice(&chunk);
+                    }
+                    BytesPacket::new(buf.freeze(), packet_accumulator.meta)
+                };
 
-                total_bytes += packet_batch[i].meta().size;
+                total_bytes += packet.meta().size;
 
-                if let Some(signature) = signature_if_should_track_packet(&packet_batch[i])
-                    .ok()
-                    .flatten()
-                {
+                if let Some(signature) = signature_if_should_track_packet(&packet).ok().flatten() {
                     packet_perf_measure.push((*signature, packet_accumulator.start_time));
                     // we set the PERF_TRACK_PACKET on
-                    packet_batch[i].meta_mut().set_track_performance(true);
+                    packet.meta_mut().set_track_performance(true);
                 }
+                packet_batch.push(packet);
                 stats
                     .total_chunks_processed_by_batcher
                     .fetch_add(num_chunks, Ordering::Relaxed);
@@ -1072,7 +1074,7 @@ async fn handle_connection(
             stream = connection.accept_uni() => match stream {
                 Ok(stream) => stream,
                 Err(e) => {
-                    debug!("stream error: {:?}", e);
+                    debug!("stream error: {e:?}");
                     break;
                 }
             },
@@ -1091,10 +1093,12 @@ async fn handle_connection(
                 STREAM_THROTTLING_INTERVAL.saturating_sub(throttle_interval_start.elapsed());
 
             if !throttle_duration.is_zero() {
-                debug!("Throttling stream from {remote_addr:?}, peer type: {:?}, total stake: {}, \
-                                    max_streams_per_interval: {max_streams_per_throttling_interval}, read_interval_streams: {streams_read_in_throttle_interval} \
-                                    throttle_duration: {throttle_duration:?}",
-                                    peer_type, total_stake);
+                debug!(
+                    "Throttling stream from {remote_addr:?}, peer type: {peer_type:?}, total \
+                     stake: {total_stake}, max_streams_per_interval: \
+                     {max_streams_per_throttling_interval}, read_interval_streams: \
+                     {streams_read_in_throttle_interval} throttle_duration: {throttle_duration:?}"
+                );
                 stats.throttled_streams.fetch_add(1, Ordering::Relaxed);
                 match peer_type {
                     ConnectionPeerType::Unstaked => {
@@ -1147,7 +1151,7 @@ async fn handle_connection(
                 Ok(Ok(chunk)) => chunk.unwrap_or(0),
                 // read_chunk returned error
                 Ok(Err(e)) => {
-                    debug!("Received stream error: {:?}", e);
+                    debug!("Received stream error: {e:?}");
                     stats
                         .total_stream_read_errors
                         .fetch_add(1, Ordering::Relaxed);
@@ -1170,9 +1174,7 @@ async fn handle_connection(
                 &packet_sender,
                 &stats,
                 peer_type,
-            )
-            .await
-            {
+            ) {
                 // The stream is finished, break out of the loop and close the stream.
                 Ok(StreamState::Finished) => {
                     last_update.store(timing::timestamp(), Ordering::Relaxed);
@@ -1226,7 +1228,7 @@ enum StreamState {
 // packet sender.
 //
 // Returns Err(()) if the stream is invalid.
-async fn handle_chunks(
+fn handle_chunks(
     chunks: impl ExactSizeIterator<Item = Bytes>,
     accum: &mut PacketAccumulator,
     packet_sender: &Sender<PacketAccumulator>,
@@ -1289,7 +1291,7 @@ async fn handle_chunks(
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
-        trace!("packet batch send error {:?}", err);
+        trace!("packet batch send error {err:?}");
     } else {
         stats
             .total_packets_sent_for_batching
@@ -1314,7 +1316,7 @@ async fn handle_chunks(
             }
         }
 
-        trace!("sent {} byte packet for batching", bytes_sent);
+        trace!("sent {bytes_sent} byte packet for batching");
     }
 
     Ok(StreamState::Finished)
@@ -1560,7 +1562,7 @@ pub mod test {
                 quic::compute_max_allowed_uni_streams,
                 testing_utilities::{
                     check_multiple_streams, get_client_config, make_client_endpoint,
-                    setup_quic_server, SpawnTestServerResult, TestServerConfig,
+                    setup_quic_server, SpawnTestServerResult,
                 },
             },
             quic::DEFAULT_TPU_COALESCE,
@@ -1569,7 +1571,7 @@ pub mod test {
         crossbeam_channel::{unbounded, Receiver},
         quinn::{ApplicationClose, ConnectionError},
         solana_keypair::Keypair,
-        solana_net_utils::bind_to_localhost,
+        solana_net_utils::sockets::bind_to_localhost_unique,
         solana_signer::Signer,
         std::collections::HashMap,
         tokio::time::sleep,
@@ -1582,14 +1584,14 @@ pub mod test {
             let mut s1 = conn1.open_uni().await.unwrap();
             s1.write_all(&[0u8]).await.unwrap();
             s1.finish().unwrap();
-            info!("done {}", i);
+            info!("done {i}");
             sleep(Duration::from_millis(1000)).await;
         }
         let mut received = 0;
         loop {
             if let Ok(_x) = receiver.try_recv() {
                 received += 1;
-                info!("got {}", received);
+                info!("got {received}");
             } else {
                 sleep(Duration::from_millis(500)).await;
             }
@@ -1684,7 +1686,7 @@ pub mod test {
             receiver: _,
             server_address: _,
             stats: _,
-        } = setup_quic_server(None, TestServerConfig::default());
+        } = setup_quic_server(None, QuicServerParams::default_for_tests());
         exit.store(true, Ordering::Relaxed);
         join_handle.await.unwrap();
     }
@@ -1698,7 +1700,7 @@ pub mod test {
             receiver,
             server_address,
             stats: _,
-        } = setup_quic_server(None, TestServerConfig::default());
+        } = setup_quic_server(None, QuicServerParams::default_for_tests());
 
         check_timeout(receiver, server_address).await;
         exit.store(true, Ordering::Relaxed);
@@ -1765,7 +1767,7 @@ pub mod test {
             receiver: _,
             server_address,
             stats,
-        } = setup_quic_server(None, TestServerConfig::default());
+        } = setup_quic_server(None, QuicServerParams::default_for_tests());
 
         let conn1 = make_client_endpoint(&server_address, None).await;
         assert_eq!(stats.total_streams.load(Ordering::Relaxed), 0);
@@ -1800,7 +1802,7 @@ pub mod test {
             receiver: _,
             server_address,
             stats: _,
-        } = setup_quic_server(None, TestServerConfig::default());
+        } = setup_quic_server(None, QuicServerParams::default_for_tests());
         check_block_multiple_connections(server_address).await;
         exit.store(true, Ordering::Relaxed);
         join_handle.await.unwrap();
@@ -1818,13 +1820,13 @@ pub mod test {
             stats,
         } = setup_quic_server(
             None,
-            TestServerConfig {
+            QuicServerParams {
                 max_connections_per_peer: 2,
-                ..Default::default()
+                ..QuicServerParams::default_for_tests()
             },
         );
 
-        let client_socket = bind_to_localhost().unwrap();
+        let client_socket = bind_to_localhost_unique().expect("should bind - client");
         let mut endpoint = quinn::Endpoint::new(
             EndpointConfig::default(),
             None,
@@ -1891,7 +1893,7 @@ pub mod test {
             receiver,
             server_address,
             stats: _,
-        } = setup_quic_server(None, TestServerConfig::default());
+        } = setup_quic_server(None, QuicServerParams::default_for_tests());
         check_multiple_writes(receiver, server_address, None).await;
         exit.store(true, Ordering::Relaxed);
         join_handle.await.unwrap();
@@ -1913,7 +1915,7 @@ pub mod test {
             receiver,
             server_address,
             stats,
-        } = setup_quic_server(Some(staked_nodes), TestServerConfig::default());
+        } = setup_quic_server(Some(staked_nodes), QuicServerParams::default_for_tests());
         check_multiple_writes(receiver, server_address, Some(&client_keypair)).await;
         exit.store(true, Ordering::Relaxed);
         join_handle.await.unwrap();
@@ -1945,7 +1947,7 @@ pub mod test {
             receiver,
             server_address,
             stats,
-        } = setup_quic_server(Some(staked_nodes), TestServerConfig::default());
+        } = setup_quic_server(Some(staked_nodes), QuicServerParams::default_for_tests());
         check_multiple_writes(receiver, server_address, Some(&client_keypair)).await;
         exit.store(true, Ordering::Relaxed);
         join_handle.await.unwrap();
@@ -1969,7 +1971,7 @@ pub mod test {
             receiver,
             server_address,
             stats,
-        } = setup_quic_server(None, TestServerConfig::default());
+        } = setup_quic_server(None, QuicServerParams::default_for_tests());
         check_multiple_writes(receiver, server_address, None).await;
         exit.store(true, Ordering::Relaxed);
         join_handle.await.unwrap();
@@ -1987,7 +1989,7 @@ pub mod test {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_quic_server_unstaked_node_connect_failure() {
         solana_logger::setup();
-        let s = bind_to_localhost().unwrap();
+        let s = bind_to_localhost_unique().expect("should bind");
         let exit = Arc::new(AtomicBool::new(false));
         let (sender, _) = unbounded();
         let keypair = Keypair::new();
@@ -2000,15 +2002,14 @@ pub mod test {
             max_concurrent_connections: _,
         } = spawn_server(
             "quic_streamer_test",
-            s,
+            [s],
             &keypair,
             sender,
             exit.clone(),
             staked_nodes,
             QuicServerParams {
                 max_unstaked_connections: 0, // Do not allow any connection from unstaked clients/nodes
-                coalesce_channel_size: 100_000, // smaller channel size for faster test
-                ..QuicServerParams::default()
+                ..QuicServerParams::default_for_tests()
             },
         )
         .unwrap();
@@ -2021,7 +2022,7 @@ pub mod test {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_quic_server_multiple_streams() {
         solana_logger::setup();
-        let s = bind_to_localhost().unwrap();
+        let s = bind_to_localhost_unique().expect("should bind");
         let exit = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = unbounded();
         let keypair = Keypair::new();
@@ -2034,15 +2035,14 @@ pub mod test {
             max_concurrent_connections: _,
         } = spawn_server(
             "quic_streamer_test",
-            s,
+            [s],
             &keypair,
             sender,
             exit.clone(),
             staked_nodes,
             QuicServerParams {
                 max_connections_per_peer: 2,
-                coalesce_channel_size: 100_000, // smaller channel size for faster test
-                ..QuicServerParams::default()
+                ..QuicServerParams::default_for_tests()
             },
         )
         .unwrap();
@@ -2394,7 +2394,7 @@ pub mod test {
             receiver,
             server_address,
             stats,
-        } = setup_quic_server(None, TestServerConfig::default());
+        } = setup_quic_server(None, QuicServerParams::default_for_tests());
 
         let client_connection = make_client_endpoint(&server_address, None).await;
 
@@ -2453,7 +2453,7 @@ pub mod test {
             stats,
             exit,
             ..
-        } = setup_quic_server(None, TestServerConfig::default());
+        } = setup_quic_server(None, QuicServerParams::default_for_tests());
 
         let client_connection = make_client_endpoint(&server_address, None).await;
 

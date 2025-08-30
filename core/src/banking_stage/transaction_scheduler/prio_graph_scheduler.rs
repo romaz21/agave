@@ -14,20 +14,18 @@ use {
         read_write_account_set::ReadWriteAccountSet,
         scheduler_messages::{ConsumeWork, FinishedConsumeWork},
         transaction_scheduler::{
-            scheduler_common::{select_thread, Batches},
-            transaction_priority_id::TransactionPriorityId,
-            transaction_state::TransactionState,
-            transaction_state_container::StateContainer,
+            scheduler_common::select_thread, transaction_priority_id::TransactionPriorityId,
+            transaction_state::TransactionState, transaction_state_container::StateContainer,
         },
     },
     crossbeam_channel::{Receiver, Sender},
     prio_graph::{AccessKind, GraphNode, PrioGraph},
     solana_cost_model::block_cost_limits::MAX_BLOCK_UNITS,
     solana_measure::measure_us,
-    solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
-    solana_sdk::saturating_add_assign,
     solana_pubkey::Pubkey,
+    solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
     solana_svm_transaction::svm_message::SVMMessage,
+    std::num::Saturating,
 };
 
 #[inline(always)]
@@ -79,7 +77,11 @@ impl<Tx: TransactionWithMeta> PrioGraphScheduler<Tx> {
         config: PrioGraphSchedulerConfig,
     ) -> Self {
         Self {
-            common: SchedulingCommon::new(consume_work_senders, finished_consume_work_receiver),
+            common: SchedulingCommon::new(
+                consume_work_senders,
+                finished_consume_work_receiver,
+                config.target_transactions_per_batch,
+            ),
             prio_graph: PrioGraph::new(passthrough_priority),
             config,
         }
@@ -131,7 +133,6 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for PrioGraphScheduler<Tx> {
             });
         }
 
-        let mut batches = Batches::new(num_threads, self.config.target_transactions_per_batch);
         // Some transactions may be unschedulable due to multi-thread conflicts.
         // These transactions cannot be scheduled until some conflicting work is completed.
         // However, the scheduler should not allow other transactions that conflict with
@@ -140,8 +141,8 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for PrioGraphScheduler<Tx> {
         let mut blocking_locks = ReadWriteAccountSet::default();
 
         // Track metrics on filter.
-        let mut num_filtered_out: usize = 0;
-        let mut total_filter_time_us: u64 = 0;
+        let mut num_filtered_out = Saturating::<usize>(0);
+        let mut total_filter_time_us = Saturating::<u64>(0);
 
         let mut window_budget = self.config.look_ahead_window_size;
         let mut chunked_pops = |container: &mut S,
@@ -170,7 +171,7 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for PrioGraphScheduler<Tx> {
 
                 let (_, filter_us) =
                     measure_us!(pre_graph_filter(&txs, &mut filter_array[..chunk_size]));
-                saturating_add_assign!(total_filter_time_us, filter_us);
+                total_filter_time_us += filter_us;
 
                 for (id, filter_result) in ids.iter().zip(&filter_array[..chunk_size]) {
                     if *filter_result {
@@ -180,7 +181,7 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for PrioGraphScheduler<Tx> {
                             Self::get_transaction_account_access(transaction),
                         );
                     } else {
-                        saturating_add_assign!(num_filtered_out, 1);
+                        num_filtered_out += 1;
                         container.remove_by_id(id.id);
                     }
                 }
@@ -195,12 +196,17 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for PrioGraphScheduler<Tx> {
         // Check transactions against filter, remove from container if it fails.
         chunked_pops(container, &mut self.prio_graph, &mut window_budget);
 
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            self.common.batches.is_empty(),
+            "batches must start empty for scheduling"
+        );
         let mut unblock_this_batch = Vec::with_capacity(
             self.common.consume_work_senders.len() * self.config.target_transactions_per_batch,
         );
         let mut num_scanned: usize = 0;
-        let mut num_scheduled: usize = 0;
-        let mut num_sent: usize = 0;
+        let mut num_scheduled = Saturating::<usize>(0);
+        let mut num_sent = Saturating::<usize>(0);
         let mut num_unschedulable_conflicts: usize = 0;
         let mut num_unschedulable_threads: usize = 0;
         while num_scanned < self.config.max_scanned_transactions_per_scheduling_pass {
@@ -228,9 +234,9 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for PrioGraphScheduler<Tx> {
                     |thread_set| {
                         select_thread(
                             thread_set,
-                            batches.total_cus(),
+                            self.common.batches.total_cus(),
                             self.common.in_flight_tracker.cus_in_flight_per_thread(),
-                            batches.transactions(),
+                            self.common.batches.transactions(),
                             self.common.in_flight_tracker.num_in_flight_per_thread(),
                         )
                     },
@@ -251,8 +257,8 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for PrioGraphScheduler<Tx> {
                         max_age,
                         cost,
                     }) => {
-                        saturating_add_assign!(num_scheduled, 1);
-                        batches.add_transaction_to_batch(
+                        num_scheduled += 1;
+                        self.common.batches.add_transaction_to_batch(
                             thread_id,
                             id.id,
                             transaction,
@@ -261,23 +267,16 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for PrioGraphScheduler<Tx> {
                         );
 
                         // If target batch size is reached, send only this batch.
-                        if batches.transactions()[thread_id].len()
+                        if self.common.batches.transactions()[thread_id].len()
                             >= self.config.target_transactions_per_batch
                         {
-                            saturating_add_assign!(
-                                num_sent,
-                                self.common.send_batch(
-                                    &mut batches,
-                                    thread_id,
-                                    self.config.target_transactions_per_batch
-                                )?
-                            );
+                            num_sent += self.common.send_batch(thread_id)?;
                         }
 
                         // if the thread is at max_cu_per_thread, remove it from the schedulable threads
                         // if there are no more schedulable threads, stop scheduling.
                         if self.common.in_flight_tracker.cus_in_flight_per_thread()[thread_id]
-                            + batches.total_cus()[thread_id]
+                            + self.common.batches.total_cus()[thread_id]
                             >= max_cu_per_thread
                         {
                             schedulable_threads.remove(thread_id);
@@ -294,14 +293,10 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for PrioGraphScheduler<Tx> {
             }
 
             // Send all non-empty batches
-            saturating_add_assign!(
-                num_sent,
-                self.common
-                    .send_batches(&mut batches, self.config.target_transactions_per_batch)?
-            );
+            num_sent += self.common.send_batches()?;
 
             // Refresh window budget and do chunked pops
-            saturating_add_assign!(window_budget, unblock_this_batch.len());
+            window_budget += unblock_this_batch.len();
             chunked_pops(container, &mut self.prio_graph, &mut window_budget);
 
             // Unblock all transactions that were blocked by the transactions that were just sent.
@@ -311,11 +306,7 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for PrioGraphScheduler<Tx> {
         }
 
         // Send batches for any remaining transactions
-        saturating_add_assign!(
-            num_sent,
-            self.common
-                .send_batches(&mut batches, self.config.target_transactions_per_batch)?
-        );
+        num_sent += self.common.send_batches()?;
 
         // Push unschedulable ids back into the container
         container.push_ids_into_queue(unschedulable_ids.into_iter());
@@ -334,6 +325,10 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for PrioGraphScheduler<Tx> {
             num_scheduled, num_sent,
             "number of scheduled and sent transactions must match"
         );
+
+        let Saturating(num_scheduled) = num_scheduled;
+        let Saturating(num_filtered_out) = num_filtered_out;
+        let Saturating(total_filter_time_us) = total_filter_time_us;
 
         Ok(SchedulingSummary {
             starting_queue_size,
@@ -438,12 +433,12 @@ mod tests {
         },
         crossbeam_channel::{unbounded, Receiver},
         itertools::Itertools,
-        solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
         solana_compute_budget_interface::ComputeBudgetInstruction,
         solana_hash::Hash,
+        solana_keypair::Keypair,
         solana_message::Message,
         solana_pubkey::Pubkey,
-        solana_keypair::Keypair,
+        solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
         solana_signer::Signer,
         solana_system_interface::instruction as system_instruction,
         solana_transaction::{sanitized::SanitizedTransaction, Transaction},

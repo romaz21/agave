@@ -63,7 +63,7 @@ pub struct BankingTracer {
 #[cfg_attr(
     feature = "frozen-abi",
     derive(AbiExample),
-    frozen_abi(digest = "DAdZnX6ijBWaxKAyksq4nJa6PAZqT4RShZqLWTtNvyAM")
+    frozen_abi(digest = "91baCBT3aY2nXSAuzY3S5dnMhWabVsHowgWqYPLjfyg7")
 )]
 #[derive(Serialize, Deserialize, Debug)]
 pub struct TimedTracedEvent(pub std::time::SystemTime, pub TracedEvent);
@@ -450,10 +450,7 @@ impl TracedSender {
                         TracedEvent::PacketBatch(self.label, BankingPacketBatch::clone(&batch)),
                     ))
                     .map_err(|err| {
-                        error!(
-                            "unexpected error when tracing a banking event...: {:?}",
-                            err
-                        );
+                        error!("unexpected error when tracing a banking event...: {err:?}");
                         SendError(BankingPacketBatch::clone(&batch))
                     })?;
             }
@@ -485,7 +482,7 @@ pub mod for_test {
     pub fn drop_and_clean_temp_dir_unless_suppressed(temp_dir: TempDir) {
         std::env::var("BANKING_TRACE_LEAVE_FILES").is_ok().then(|| {
             warn!("prevented to remove {:?}", temp_dir.path());
-            drop(temp_dir.into_path());
+            drop(temp_dir.keep());
         });
     }
 

@@ -8,7 +8,7 @@ use {
         feature::{status_from_account, CliFeatureStatus},
         program::calculate_max_chunk_size,
     },
-    agave_feature_set::{FeatureSet, FEATURE_NAMES},
+    agave_feature_set::{raise_cpi_nesting_limit_to_8, FeatureSet, FEATURE_NAMES},
     clap::{value_t, App, AppSettings, Arg, ArgMatches, SubCommand},
     log::*,
     solana_account::Account,
@@ -169,9 +169,7 @@ impl ProgramV4SubCommands for App<'_, '_> {
                                 .value_name("PROGRAM_SIGNER")
                                 .takes_value(true)
                                 .validator(is_valid_signer)
-                                .help(
-                                    "Program account signer for deploying a new program",
-                                ),
+                                .help("Program account signer for deploying a new program"),
                         )
                         .arg(
                             Arg::with_name("program-id")
@@ -186,9 +184,7 @@ impl ProgramV4SubCommands for App<'_, '_> {
                                 .value_name("BUFFER_SIGNER")
                                 .takes_value(true)
                                 .validator(is_valid_signer)
-                                .help(
-                                    "Optional intermediate buffer account to write data to",
-                                ),
+                                .help("Optional intermediate buffer account to write data to"),
                         )
                         .arg(
                             Arg::with_name("authority")
@@ -253,7 +249,8 @@ impl ProgramV4SubCommands for App<'_, '_> {
                                 .takes_value(true)
                                 .validator(is_valid_signer)
                                 .help(
-                                    "Current program authority [default: the default configured keypair]",
+                                    "Current program authority [default: the default configured \
+                                     keypair]",
                                 ),
                         )
                         .arg(
@@ -263,9 +260,7 @@ impl ProgramV4SubCommands for App<'_, '_> {
                                 .takes_value(true)
                                 .required(true)
                                 .validator(is_valid_signer)
-                                .help(
-                                    "New program authority",
-                                ),
+                                .help("New program authority"),
                         )
                         .offline_args()
                         .arg(compute_unit_price_arg()),
@@ -298,7 +293,9 @@ impl ProgramV4SubCommands for App<'_, '_> {
                                 .takes_value(true)
                                 .validator(is_valid_signer)
                                 .help(
-                                    "Reserves the address and links it as the programs next-version, which is a hint that frontends can show to users",
+                                    "Reserves the address and links it as the programs \
+                                     next-version, which is a hint that frontends can show to \
+                                     users",
                                 ),
                         )
                         .offline_args()
@@ -625,13 +622,13 @@ pub fn process_program_v4_subcommand(
 // * Upload a new program account and deploy it
 //   - buffer_address must be `None`
 //   - upload_signer_index must be `Some(program_signer_index)`
-// * Single-step redeploy an exisiting program using the original program account
+// * Single-step redeploy an existing program using the original program account
 //   - buffer_address must be `None`
 //   - upload_signer_index must be `None`
-// * Single-step redeploy an exisiting program using a buffer account
+// * Single-step redeploy an existing program using a buffer account
 //   - buffer_address must be `Some(buffer_signer.pubkey())`
 //   - upload_signer_index must be `Some(buffer_signer_index)`
-// * Two-step redeploy an exisiting program using a buffer account
+// * Two-step redeploy an existing program using a buffer account
 //   - buffer_address must be `Some(buffer_signer.pubkey())`
 //   - upload_signer_index must be None
 pub fn process_deploy_program(
@@ -672,12 +669,20 @@ pub fn process_deploy_program(
     {
         // Deploy new program
         if program_account_exists {
-            return Err("Program account does exist already. Did you perhaps intent to redeploy an existing program instead? Then use --program-id instead of --program-keypair.".into());
+            return Err(
+                "Program account does exist already. Did you perhaps intent to redeploy an \
+                 existing program instead? Then use --program-id instead of --program-keypair."
+                    .into(),
+            );
         }
     } else {
         // Redeploy an existing program
         if !program_account_exists {
-            return Err("Program account does not exist. Did you perhaps intent to deploy a new program instead? Then use --program-keypair instead of --program-id.".into());
+            return Err(
+                "Program account does not exist. Did you perhaps intent to deploy a new program \
+                 instead? Then use --program-keypair instead of --program-id."
+                    .into(),
+            );
         }
     }
     if let Some(program_account) = program_account.as_ref() {
@@ -715,14 +720,15 @@ pub fn process_deploy_program(
                 }
             });
     }
-    let program_runtime_environment =
-        solana_bpf_loader_program::syscalls::create_program_runtime_environment_v1(
-            &feature_set.runtime_features(),
-            &SVMTransactionExecutionBudget::default(),
-            true,
-            false,
-        )
-        .unwrap();
+    let program_runtime_environment = agave_syscalls::create_program_runtime_environment_v1(
+        &feature_set.runtime_features(),
+        &SVMTransactionExecutionBudget::new_with_defaults(
+            feature_set.is_active(&raise_cpi_nesting_limit_to_8::id()),
+        ),
+        true,
+        false,
+    )
+    .unwrap();
 
     // Verify the program
     let upload_range =
@@ -731,7 +737,7 @@ pub fn process_deploy_program(
         (MAX_PERMITTED_DATA_LENGTH as usize).saturating_sub(LoaderV4State::program_data_offset());
     if program_data.len() > MAX_LEN {
         return Err(format!(
-            "Program length {} exeeds maximum length {}",
+            "Program length {} exceeds maximum length {}",
             program_data.len(),
             MAX_LEN,
         )
@@ -739,7 +745,7 @@ pub fn process_deploy_program(
     }
     if upload_range.end > program_data.len() {
         return Err(format!(
-            "Range end {} exeeds program length {}",
+            "Range end {} exceeds program length {}",
             upload_range.end,
             program_data.len(),
         )
@@ -814,14 +820,13 @@ pub fn process_deploy_program(
     if upload_signer_index.is_none() {
         if upload_account.is_none() {
             return Err(format!(
-                "No ELF was provided or uploaded to the account {:?}",
-                upload_address,
+                "No ELF was provided or uploaded to the account {upload_address:?}",
             )
             .into());
         }
     } else {
         if upload_range.is_empty() {
-            return Err(format!("Attempting to upload empty range {:?}", upload_range).into());
+            return Err(format!("Attempting to upload empty range {upload_range:?}").into());
         }
         let first_write_message = Message::new(
             &[instruction::write(
@@ -1257,7 +1262,7 @@ fn send_messages(
 
         if !transaction_errors.is_empty() {
             for transaction_error in &transaction_errors {
-                error!("{:?}", transaction_error);
+                error!("{transaction_error:?}");
             }
             return Err(format!("{} write transactions failed", transaction_errors.len()).into());
         }
